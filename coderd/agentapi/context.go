@@ -6,6 +6,7 @@ import (
 	"errors"
 	"math"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -18,6 +19,8 @@ import (
 	agentproto "github.com/coder/coder/v2/agent/proto"
 	"github.com/coder/coder/v2/coderd/database"
 	"github.com/coder/coder/v2/coderd/database/dbtime"
+	"github.com/coder/coder/v2/codersdk"
+	"github.com/coder/coder/v2/codersdk/workspacesdk"
 	"github.com/coder/quartz"
 )
 
@@ -75,6 +78,10 @@ type ContextAPI struct {
 	// deployment-wide kill switch for context sync write load
 	// (CODER_DISABLE_WORKSPACE_AGENT_CONTEXT_SYNC).
 	Disabled bool
+	// Experiments gates Agent Plugins data. With agent-plugins disabled,
+	// plugin resources and resources with a plugin_name are dropped
+	// before storing; the aggregate hash is stored as sent.
+	Experiments codersdk.Experiments
 }
 
 // ContextDirtyMarker hydrates chats from, and marks chats dirty against, a
@@ -126,7 +133,7 @@ func (a *ContextAPI) PushContextState(ctx context.Context, req *agentproto.PushC
 		return nil, err
 	}
 
-	rows, err := validateAndConvertContextResources(req.Resources)
+	rows, err := validateAndConvertContextResources(req.Resources, a.Experiments)
 	if err != nil {
 		return nil, err
 	}
@@ -277,10 +284,20 @@ func validateContextPushRequest(req *agentproto.PushContextStateRequest) error {
 //
 //   - empty, oversized, or duplicate sources (the PK depends on
 //     uniqueness and indexes the source column),
-//   - unknown body variants (kept extensible by emitting the proto's
-//     reserved kinds via dedicated body messages),
+//   - unknown body variants,
+//   - plugin names that fail workspacesdk.ValidatePluginName, OK plugin
+//     resources without a name, names that more than one OK plugin
+//     resource uses, skills and MCP servers whose plugin_name
+//     names no OK plugin resource in the push, plugin skill sources
+//     outside "<plugin source>/skills/", and plugin MCP server sources
+//     other than "<plugin_name>/<server_name>" or with an empty
+//     server_name,
 //   - unknown status enum values,
 //   - per-resource and aggregate body sizes past the server caps.
+//
+// With the agent-plugins experiment off, plugin resources and
+// resources with a plugin name are dropped without validation. Error
+// indexes refer to resources as sent.
 //
 // Validation is deliberately strict here so a misbehaving agent
 // cannot poison the snapshot table. Phase 2 readers can then trust
@@ -288,13 +305,22 @@ func validateContextPushRequest(req *agentproto.PushContextStateRequest) error {
 //
 // WorkspaceAgentID and Now are left unset; the caller fills them at
 // upsert time.
-func validateAndConvertContextResources(resources []*agentproto.ContextResource) ([]database.UpsertWorkspaceAgentContextResourceParams, error) {
+func validateAndConvertContextResources(resources []*agentproto.ContextResource, experiments codersdk.Experiments) ([]database.UpsertWorkspaceAgentContextResourceParams, error) {
+	pluginsEnabled := experiments.Enabled(codersdk.ExperimentAgentPlugins)
+	var plugins okPlugins
+	if pluginsEnabled {
+		plugins = collectOKPlugins(resources)
+	}
+
 	rows := make([]database.UpsertWorkspaceAgentContextResourceParams, 0, len(resources))
 	seen := make(map[string]struct{}, len(resources))
 	aggregateBodyBytes := 0
 	for i, r := range resources {
 		if r == nil {
 			return nil, xerrors.Errorf("agentapi: PushContextState resource at index %d is nil", i)
+		}
+		if !pluginsEnabled && isPluginData(r) {
+			continue
 		}
 		if r.Source == "" {
 			return nil, xerrors.Errorf("agentapi: PushContextState resource at index %d has empty source", i)
@@ -327,6 +353,9 @@ func validateAndConvertContextResources(resources []*agentproto.ContextResource)
 		if len(body) > maxContextResourceBodyBytes {
 			return nil, xerrors.Errorf("resource %q: body is %d bytes, exceeds %d byte cap", r.Source, len(body), maxContextResourceBodyBytes)
 		}
+		if err := validateContextPluginFields(r, plugins); err != nil {
+			return nil, xerrors.Errorf("resource %q: %w", r.Source, err)
+		}
 		aggregateBodyBytes += len(body)
 		if aggregateBodyBytes > maxContextAggregateBodyBytes {
 			return nil, xerrors.Errorf("agentapi: PushContextState aggregate body size exceeds %d byte cap", maxContextAggregateBodyBytes)
@@ -350,6 +379,109 @@ func validateAndConvertContextResources(resources []*agentproto.ContextResource)
 		})
 	}
 	return rows, nil
+}
+
+// contextPluginName returns the plugin name carried by r: the manifest
+// name for a plugin resource, or plugin_name for a skill or MCP server.
+func contextPluginName(r *agentproto.ContextResource) string {
+	switch b := r.Body.(type) {
+	case *agentproto.ContextResource_Plugin:
+		return b.Plugin.GetName()
+	case *agentproto.ContextResource_Skill:
+		return b.Skill.GetPluginName()
+	case *agentproto.ContextResource_McpServer:
+		return b.McpServer.GetPluginName()
+	default:
+		return ""
+	}
+}
+
+// okPlugins indexes the OK plugin resources of a push by name. sources
+// holds the first source per name; dups holds the second source of
+// each name more than one OK plugin resource uses.
+type okPlugins struct {
+	sources map[string]string
+	dups    map[string]string
+}
+
+// collectOKPlugins indexes the OK plugin resources in resources so a
+// skill or server may precede its plugin. Resources with an oversized
+// source are left out; the main validation loop rejects them.
+func collectOKPlugins(resources []*agentproto.ContextResource) okPlugins {
+	p := okPlugins{sources: map[string]string{}, dups: map[string]string{}}
+	for _, r := range resources {
+		plugin := r.GetPlugin()
+		if plugin == nil || r.Status != agentproto.ContextResource_OK || plugin.GetName() == "" || len(r.Source) > maxContextSourceBytes {
+			continue
+		}
+		name := plugin.GetName()
+		if _, ok := p.sources[name]; !ok {
+			p.sources[name] = r.Source
+		} else if _, ok := p.dups[name]; !ok && r.Source != p.sources[name] {
+			p.dups[name] = r.Source
+		}
+	}
+	return p
+}
+
+// validateContextPluginFields checks the Agent Plugins fields of r
+// against plugins:
+//
+//   - a non-empty plugin name must pass workspacesdk.ValidatePluginName
+//     and must not be used by more than one OK plugin resource,
+//   - an OK plugin resource must carry a name; a non-OK one may omit it,
+//   - a skill or MCP server plugin_name must name an OK plugin,
+//   - a plugin skill's source must be under "<plugin source>/skills/",
+//     with either path separator,
+//   - a plugin MCP server's server_name must be non-empty and its
+//     source must be "<plugin_name>/<server_name>".
+//
+// The skills/ check is a string prefix, not path containment. Errors
+// quote only capped or validated strings.
+func validateContextPluginFields(r *agentproto.ContextResource, plugins okPlugins) error {
+	name := contextPluginName(r)
+	if name == "" {
+		if _, ok := r.Body.(*agentproto.ContextResource_Plugin); ok && r.Status == agentproto.ContextResource_OK {
+			return xerrors.New("plugin name is required on an ok plugin resource")
+		}
+		return nil
+	}
+	if err := workspacesdk.ValidatePluginName(name); err != nil {
+		return err
+	}
+	if second, ok := plugins.dups[name]; ok {
+		return xerrors.Errorf("ok plugin name %q is used by both %q and %q", name, plugins.sources[name], second)
+	}
+	if r.GetPlugin() != nil {
+		return nil
+	}
+	pluginSource, ok := plugins.sources[name]
+	if !ok {
+		return xerrors.Errorf("plugin_name %q names no ok plugin resource in the push", name)
+	}
+	if r.GetSkill() != nil {
+		source := strings.ReplaceAll(r.Source, `\`, "/")
+		prefix := strings.ReplaceAll(pluginSource, `\`, "/") + "/skills/"
+		if !strings.HasPrefix(source, prefix) {
+			return xerrors.Errorf("plugin skill source must be under %q", pluginSource+"/skills/")
+		}
+	}
+	if server := r.GetMcpServer(); server != nil {
+		if server.GetServerName() == "" {
+			return xerrors.New("plugin MCP server_name is required")
+		}
+		if r.Source != name+"/"+server.GetServerName() {
+			return xerrors.New(`plugin MCP server source must be "<plugin_name>/<server_name>"`)
+		}
+	}
+	return nil
+}
+
+// isPluginData reports whether r is a plugin resource or carries a
+// plugin name.
+func isPluginData(r *agentproto.ContextResource) bool {
+	_, ok := r.Body.(*agentproto.ContextResource_Plugin)
+	return ok || contextPluginName(r) != ""
 }
 
 // marshalContextResourceBody picks the body variant set on the wire
@@ -393,6 +525,13 @@ func marshalContextResourceBody(r *agentproto.ContextResource) (kind database.Wo
 		}
 		body, err = marshalBody(payload)
 		return database.WorkspaceAgentContextBodyKindMcpServer, body, err
+	case *agentproto.ContextResource_Plugin:
+		payload := b.Plugin
+		if payload == nil {
+			payload = &agentproto.PluginBody{}
+		}
+		body, err = marshalBody(payload)
+		return database.WorkspaceAgentContextBodyKindPlugin, body, err
 	case nil:
 		return "", nil, xerrors.Errorf("missing body variant; status %s requires a typed body", r.Status)
 	default:
