@@ -52,9 +52,9 @@ func TestFamilySeriesCoverRawFamilies(t *testing.T) {
 		reported[family] = true
 	}
 	covered := map[codersdk.AppFamilyName]bool{}
-	for _, series := range familySeries {
-		require.NotEmpty(t, series.applicationName, "family %q", series.family)
-		covered[series.family] = true
+	for _, family := range familySeries {
+		require.NotEmpty(t, family.DisplayName(), "family %q", family)
+		covered[family] = true
 	}
 	require.Equal(t, reported, covered)
 }

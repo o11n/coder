@@ -21,7 +21,7 @@ import (
 
 var (
 	templatesActiveUsersDesc     = prometheus.NewDesc("coderd_insights_templates_active_users", "The number of active users of the template.", []string{"template_name", "organization_name"}, nil)
-	applicationsUsageSecondsDesc = prometheus.NewDesc("coderd_insights_applications_usage_seconds", "The application usage per template.", []string{"template_name", "application_name", "slug", "organization_name"}, nil)
+	applicationsUsageSecondsDesc = prometheus.NewDesc("coderd_insights_applications_usage_seconds", "The application usage per template. Built-in apps are totaled by family and have an empty slug.", []string{"template_name", "application_name", "slug", "organization_name"}, nil)
 	parametersDesc               = prometheus.NewDesc("coderd_insights_parameters", "The parameter usage per template.", []string{"template_name", "parameter_name", "parameter_type", "parameter_value", "organization_name"}, nil)
 )
 
@@ -244,11 +244,11 @@ func (mc *MetricsCollector) Collect(metricsCh chan<- prometheus.Metric) {
 	// Built-in apps, one series per session family.
 	for _, templateRow := range data.templates {
 		orgName := data.organizationNames[templateRow.templateID]
-		for _, series := range familySeries {
+		for _, family := range familySeries {
 			metricsCh <- prometheus.MustNewConstMetric(applicationsUsageSecondsDesc, prometheus.GaugeValue,
-				float64(templateRow.usageSecondsByFamily[series.family]),
+				float64(templateRow.usageSecondsByFamily[family]),
 				data.templateNames[templateRow.templateID],
-				series.applicationName,
+				family.DisplayName(),
 				"", orgName)
 		}
 	}
@@ -298,18 +298,14 @@ func onlyTemplateNames(templates []database.Template) map[uuid.UUID]string {
 // familySeries lists the session families the application usage metric
 // reports, so the series stay bounded however many app names agents report.
 // Template apps have their own series.
-var familySeries = []struct {
-	family          codersdk.AppFamilyName
-	applicationName string
-}{
-	{codersdk.AppFamilyVSCode, codersdk.TemplateBuiltinAppDisplayNameVSCode},
-	{codersdk.AppFamilyJetBrains, codersdk.TemplateBuiltinAppDisplayNameJetBrains},
-	{codersdk.AppFamilyReconnectingPTY, codersdk.TemplateBuiltinAppDisplayNameWebTerminal},
-	{codersdk.AppFamilySSH, codersdk.TemplateBuiltinAppDisplayNameSSH},
-	// No Coder client reports sftp, but any client may supply the name.
-	{codersdk.AppFamilySFTP, codersdk.TemplateBuiltinAppDisplayNameSFTP},
-	{codersdk.AppFamilyPortForwarding, codersdk.TemplateBuiltinAppDisplayNamePortForwarding},
-	{codersdk.AppFamilyUnknown, codersdk.TemplateBuiltinAppDisplayNameUnknown},
+var familySeries = []codersdk.AppFamilyName{
+	codersdk.AppFamilyVSCode,
+	codersdk.AppFamilyJetBrains,
+	codersdk.AppFamilyReconnectingPTY,
+	codersdk.AppFamilySSH,
+	codersdk.AppFamilySFTP,
+	codersdk.AppFamilyPortForwarding,
+	codersdk.AppFamilyUnknown,
 }
 
 // registryFamilies returns the registry's app-to-family mapping as the

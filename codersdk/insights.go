@@ -204,18 +204,6 @@ const (
 	TemplateAppsTypeApp     TemplateAppsType = "app"
 )
 
-// Enums define the display name of the builtin app reported.
-const (
-	TemplateBuiltinAppDisplayNameVSCode      string = "Visual Studio Code"
-	TemplateBuiltinAppDisplayNameJetBrains   string = "JetBrains"
-	TemplateBuiltinAppDisplayNameWebTerminal string = "Web Terminal"
-	TemplateBuiltinAppDisplayNameSSH         string = "SSH"
-	TemplateBuiltinAppDisplayNameSFTP        string = "SFTP"
-	// The two below only label the Prometheus family usage series.
-	TemplateBuiltinAppDisplayNamePortForwarding string = "Port Forwarding"
-	TemplateBuiltinAppDisplayNameUnknown        string = "Unknown"
-)
-
 // TemplateAppUsage shows the usage of an app for one or more templates.
 type TemplateAppUsage struct {
 	TemplateIDs []uuid.UUID      `json:"template_ids" format:"uuid"`
