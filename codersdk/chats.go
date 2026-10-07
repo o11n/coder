@@ -964,7 +964,8 @@ type ChatMessagesResponse struct {
 	QueuedMessages []ChatQueuedMessage `json:"queued_messages"`
 	HasMore        bool                `json:"has_more"`
 	// HistoryVersion is the chat history_version this page was read at.
-	// Pass it as after_revision when opening the stream.
+	// Pass it as after_revision when opening the stream. Set only on the
+	// page requested without before_id or after_id.
 	HistoryVersion int64 `json:"history_version,omitempty"`
 }
 

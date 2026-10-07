@@ -3828,12 +3828,12 @@ AuthorizationObject can represent a "set" of objects, such as: all workspaces in
 
 ### Properties
 
-| Name              | Type                                                              | Required | Restrictions | Description                                                                                                           |
-|-------------------|-------------------------------------------------------------------|----------|--------------|-----------------------------------------------------------------------------------------------------------------------|
-| `has_more`        | boolean                                                           | false    |              |                                                                                                                       |
-| `history_version` | integer                                                           | false    |              | History version is the chat history_version this page was read at. Pass it as after_revision when opening the stream. |
-| `messages`        | array of [codersdk.ChatMessage](#codersdkchatmessage)             | false    |              |                                                                                                                       |
-| `queued_messages` | array of [codersdk.ChatQueuedMessage](#codersdkchatqueuedmessage) | false    |              |                                                                                                                       |
+| Name              | Type                                                              | Required | Restrictions | Description                                                                                                                                                                         |
+|-------------------|-------------------------------------------------------------------|----------|--------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `has_more`        | boolean                                                           | false    |              |                                                                                                                                                                                     |
+| `history_version` | integer                                                           | false    |              | History version is the chat history_version this page was read at. Pass it as after_revision when opening the stream. Set only on the page requested without before_id or after_id. |
+| `messages`        | array of [codersdk.ChatMessage](#codersdkchatmessage)             | false    |              |                                                                                                                                                                                     |
+| `queued_messages` | array of [codersdk.ChatQueuedMessage](#codersdkchatqueuedmessage) | false    |              |                                                                                                                                                                                     |
 
 ## codersdk.ChatModel
 

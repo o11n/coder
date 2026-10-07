@@ -1855,7 +1855,12 @@ func (api *API) getChatMessages(rw http.ResponseWriter, r *http.Request) {
 	// load. Suppress them whenever any cursor is set so polling callers do
 	// not receive the snapshot on every page fetch.
 	var queuedMessages []database.ChatQueuedMessage
+	var historyVersion int64
 	if beforeID == 0 && afterID == 0 {
+		// Read by the route middleware before the page query, so never
+		// newer than the page's rows. A cursored page may stop short of
+		// the newest message, so it carries no version.
+		historyVersion = chat.HistoryVersion
 		queuedMessages, err = api.Database.GetChatQueuedMessages(ctx, chatID)
 		if err != nil {
 			httpapi.Write(ctx, rw, http.StatusInternalServerError, codersdk.Response{
@@ -1870,9 +1875,7 @@ func (api *API) getChatMessages(rw http.ResponseWriter, r *http.Request) {
 		Messages:       convertChatMessages(messages),
 		QueuedMessages: convertChatQueuedMessages(queuedMessages),
 		HasMore:        hasMore,
-		// Read by the route middleware before the page query, so never
-		// newer than the page's rows.
-		HistoryVersion: chat.HistoryVersion,
+		HistoryVersion: historyVersion,
 	})
 }
 
