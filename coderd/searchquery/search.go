@@ -14,6 +14,7 @@ import (
 	"golang.org/x/xerrors"
 
 	"github.com/coder/coder/v2/coderd/database"
+	"github.com/coder/coder/v2/coderd/database/sdk2db"
 	"github.com/coder/coder/v2/coderd/httpapi"
 	"github.com/coder/coder/v2/codersdk"
 )
@@ -104,7 +105,6 @@ func ConnectionLogs(ctx context.Context, db database.Store, query string, apiKey
 		OrganizationID:      parseOrganization(ctx, db, parser, values, "organization"),
 		WorkspaceOwner:      parser.String(values, "", "workspace_owner"),
 		WorkspaceOwnerEmail: parser.String(values, "", "workspace_owner_email"),
-		Type:                string(httpapi.ParseCustom(parser, values, "", "type", httpapi.ParseEnum[database.ConnectionType])),
 		Username:            parser.String(values, "", "username"),
 		UserEmail:           parser.String(values, "", "user_email"),
 		ConnectedAfter:      parser.Time3339Nano(values, time.Time{}, "connected_after"),
@@ -112,6 +112,15 @@ func ConnectionLogs(ctx context.Context, db database.Store, query string, apiKey
 		WorkspaceID:         parser.UUID(values, uuid.Nil, "workspace_id"),
 		ConnectionID:        parser.UUID(values, uuid.Nil, "connection_id"),
 		Status:              string(httpapi.ParseCustom(parser, values, "", "status", httpapi.ParseEnum[codersdk.ConnectionLogStatus])),
+	}
+
+	method, appNames, excludedAppNames := sdk2db.ConnectionLogTypeFilter(
+		httpapi.ParseCustom(parser, values, "", "type", httpapi.ParseEnum[codersdk.ConnectionType]),
+	)
+	filter.LegacyMethod, filter.AppNames, filter.ExcludedAppNames = method, appNames, excludedAppNames
+	filter.ConnectionMethod = string(httpapi.ParseCustom(parser, values, "", "method", httpapi.ParseEnum[codersdk.ConnectionLogMethod]))
+	if app := parser.String(values, "", "app"); app != "" {
+		filter.AppName = codersdk.NormalizeAppName(app)
 	}
 
 	if filter.Username == "me" {
@@ -131,15 +140,20 @@ func ConnectionLogs(ctx context.Context, db database.Store, query string, apiKey
 		WorkspaceOwner:      filter.WorkspaceOwner,
 		WorkspaceOwnerID:    filter.WorkspaceOwnerID,
 		WorkspaceOwnerEmail: filter.WorkspaceOwnerEmail,
-		Type:                filter.Type,
-		UserID:              filter.UserID,
-		Username:            filter.Username,
-		UserEmail:           filter.UserEmail,
-		ConnectedAfter:      filter.ConnectedAfter,
-		ConnectedBefore:     filter.ConnectedBefore,
-		WorkspaceID:         filter.WorkspaceID,
-		ConnectionID:        filter.ConnectionID,
-		Status:              filter.Status,
+		ConnectionMethod:    filter.ConnectionMethod,
+		LegacyMethod:        filter.LegacyMethod,
+		AppNames:            filter.AppNames,
+		ExcludedAppNames:    filter.ExcludedAppNames,
+		AppName:             filter.AppName,
+
+		UserID:          filter.UserID,
+		Username:        filter.Username,
+		UserEmail:       filter.UserEmail,
+		ConnectedAfter:  filter.ConnectedAfter,
+		ConnectedBefore: filter.ConnectedBefore,
+		WorkspaceID:     filter.WorkspaceID,
+		ConnectionID:    filter.ConnectionID,
+		Status:          filter.Status,
 	}
 	parser.ErrorExcessParams(values)
 	return filter, countFilter, parser.Errors

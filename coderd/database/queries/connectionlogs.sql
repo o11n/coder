@@ -59,10 +59,33 @@ WHERE
 			)
 		ELSE true
 	END
-	-- Filter by type
+	-- Filter by method, independently of the legacy type filter
 	AND CASE
-		WHEN @type :: text != '' THEN
-			type = @type :: connection_type
+		WHEN @connection_method :: text != '' THEN
+			connection_method = @connection_method :: connection_log_method
+		ELSE true
+	END
+	AND CASE
+		WHEN @legacy_method :: text != '' THEN
+			connection_method = @legacy_method :: connection_log_method
+		ELSE true
+	END
+	-- Filter by app name
+	AND CASE
+		WHEN cardinality(@app_names :: text[]) > 0 THEN
+			connection_method = 'ssh' AND app_name_or_port = ANY(@app_names :: text[])
+		ELSE true
+	END
+	-- Filter by excluded app name
+	AND CASE
+		WHEN cardinality(@excluded_app_names :: text[]) > 0 THEN
+			connection_method = 'ssh' AND (app_name_or_port IS NULL OR app_name_or_port != ALL(@excluded_app_names :: text[]))
+		ELSE true
+	END
+	-- Filter by client app identity
+	AND CASE
+		WHEN @app_name :: text != '' THEN
+			connection_method IN ('ssh', 'reconnecting_pty') AND app_name_or_port = @app_name
 		ELSE true
 	END
 	-- Filter by user_id
@@ -117,7 +140,7 @@ WHERE
 			(@status = 'completed' AND disconnect_time IS NOT NULL)) AND
 			-- Exclude point-in-time events reported by coderd, since we
 			-- don't know their close time.
-			"type" NOT IN ('workspace_app', 'port_forwarding', 'tunnel')
+			connection_method IN ('ssh', 'reconnecting_pty')
 		ELSE true
 	END
 	-- Authorize Filter clause will be injected below in
@@ -175,10 +198,33 @@ SELECT COUNT(*) AS count FROM (
 				)
 			ELSE true
 		END
-		-- Filter by type
+		-- Filter by method, independently of the legacy type filter
 		AND CASE
-			WHEN @type :: text != '' THEN
-				type = @type :: connection_type
+			WHEN @connection_method :: text != '' THEN
+				connection_method = @connection_method :: connection_log_method
+			ELSE true
+		END
+		AND CASE
+			WHEN @legacy_method :: text != '' THEN
+				connection_method = @legacy_method :: connection_log_method
+			ELSE true
+		END
+		-- Filter by app name
+		AND CASE
+			WHEN cardinality(@app_names :: text[]) > 0 THEN
+				connection_method = 'ssh' AND app_name_or_port = ANY(@app_names :: text[])
+			ELSE true
+		END
+		-- Filter by excluded app name
+		AND CASE
+			WHEN cardinality(@excluded_app_names :: text[]) > 0 THEN
+				connection_method = 'ssh' AND (app_name_or_port IS NULL OR app_name_or_port != ALL(@excluded_app_names :: text[]))
+			ELSE true
+		END
+		-- Filter by client app identity
+		AND CASE
+			WHEN @app_name :: text != '' THEN
+				connection_method IN ('ssh', 'reconnecting_pty') AND app_name_or_port = @app_name
 			ELSE true
 		END
 		-- Filter by user_id
@@ -233,7 +279,7 @@ SELECT COUNT(*) AS count FROM (
 				(@status = 'completed' AND disconnect_time IS NOT NULL)) AND
 				-- Exclude point-in-time events reported by coderd, since we
 				-- don't know their close time.
-				"type" NOT IN ('workspace_app', 'port_forwarding', 'tunnel')
+				connection_method IN ('ssh', 'reconnecting_pty')
 			ELSE true
 		END
 		-- Authorize Filter clause will be injected below in
@@ -258,9 +304,9 @@ WHERE connection_logs.id = old_logs.id;
 -- name: BatchUpsertConnectionLogs :exec
 INSERT INTO connection_logs (
     id, connect_time, organization_id, workspace_owner_id, workspace_id,
-    workspace_name, agent_name, type, code, ip, user_agent, user_id,
-    slug_or_port, connection_id, disconnect_reason, disconnect_time,
-	client_session_id
+    workspace_name, agent_name, connection_method, code, ip, user_agent, user_id,
+    app_name_or_port, connection_id, disconnect_reason, disconnect_time,
+    client_session_id
 )
 SELECT
     u.id,
@@ -270,14 +316,14 @@ SELECT
     u.workspace_id,
     u.workspace_name,
     u.agent_name,
-    u.type,
+    u.connection_method,
     -- Use the validity flag to distinguish "no code" (NULL) from a
     -- legitimate zero exit code.
     CASE WHEN u.code_valid THEN u.code ELSE NULL END,
     u.ip,
     NULLIF(u.user_agent, ''),
     NULLIF(u.user_id, '00000000-0000-0000-0000-000000000000'::uuid),
-    NULLIF(u.slug_or_port, ''),
+    NULLIF(u.app_name_or_port, ''),
     NULLIF(u.connection_id, '00000000-0000-0000-0000-000000000000'::uuid),
     NULLIF(u.disconnect_reason, ''),
     NULLIF(u.disconnect_time, '0001-01-01 00:00:00Z'::timestamptz),
@@ -291,13 +337,13 @@ FROM (
         unnest(sqlc.arg('workspace_id')::uuid[]) AS workspace_id,
         unnest(sqlc.arg('workspace_name')::text[]) AS workspace_name,
         unnest(sqlc.arg('agent_name')::text[]) AS agent_name,
-        unnest(sqlc.arg('type')::connection_type[]) AS type,
+        unnest(sqlc.arg('connection_method')::connection_log_method[]) AS connection_method,
         unnest(sqlc.arg('code')::int4[]) AS code,
         unnest(sqlc.arg('code_valid')::bool[]) AS code_valid,
         unnest(sqlc.arg('ip')::inet[]) AS ip,
         unnest(sqlc.arg('user_agent')::text[]) AS user_agent,
         unnest(sqlc.arg('user_id')::uuid[]) AS user_id,
-        unnest(sqlc.arg('slug_or_port')::text[]) AS slug_or_port,
+        unnest(sqlc.arg('app_name_or_port')::text[]) AS app_name_or_port,
         unnest(sqlc.arg('connection_id')::uuid[]) AS connection_id,
         unnest(sqlc.arg('disconnect_reason')::text[]) AS disconnect_reason,
         unnest(sqlc.arg('disconnect_time')::timestamptz[]) AS disconnect_time,

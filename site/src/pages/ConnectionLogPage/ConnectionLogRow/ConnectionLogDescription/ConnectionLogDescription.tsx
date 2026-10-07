@@ -1,7 +1,7 @@
 import { Link as RouterLink } from "react-router";
 import type { ConnectionLog } from "#/api/typesGenerated";
 import { Link } from "#/components/Link/Link";
-import { connectionTypeToFriendlyName } from "#/utils/connection";
+import { connectionLogMethodLabels } from "../../connectionLogMethodLabels";
 
 type ConnectionLogDescriptionProps = {
 	connectionLog: ConnectionLog;
@@ -10,16 +10,22 @@ type ConnectionLogDescriptionProps = {
 export const ConnectionLogDescription: React.FC<
 	ConnectionLogDescriptionProps
 > = ({ connectionLog }) => {
-	const { type, workspace_owner_username, workspace_name, web_info } =
-		connectionLog;
+	const {
+		connection_method,
+		app_name,
+		app_display_name,
+		workspace_owner_username,
+		workspace_name,
+		web_info,
+	} = connectionLog;
 
-	switch (type) {
+	switch (connection_method) {
 		case "port_forwarding":
 		case "workspace_app": {
 			if (!web_info) return null;
 
 			const { user, slug_or_port, status_code } = web_info;
-			const isPortForward = type === "port_forwarding";
+			const isPortForward = connection_method === "port_forwarding";
 			const presentAction = isPortForward ? "access" : "open";
 			const pastAction = isPortForward ? "accessed" : "opened";
 
@@ -71,24 +77,6 @@ export const ConnectionLogDescription: React.FC<
 			);
 		}
 
-		case "reconnecting_pty":
-		case "ssh":
-		case "jetbrains":
-		case "vscode": {
-			const friendlyType = connectionTypeToFriendlyName(type);
-			return (
-				<span>
-					{friendlyType} session to {workspace_owner_username}'s{" "}
-					<Link asChild showExternalIcon={false} className="text-base">
-						<RouterLink to={`/@${workspace_owner_username}/${workspace_name}`}>
-							<strong>{workspace_name}</strong>
-						</RouterLink>
-					</Link>{" "}
-					workspace{" "}
-				</span>
-			);
-		}
-
 		case "tunnel": {
 			if (!web_info) return null;
 			const { user, status_code } = web_info;
@@ -108,6 +96,32 @@ export const ConnectionLogDescription: React.FC<
 						</RouterLink>
 					</Link>{" "}
 					workspace
+				</span>
+			);
+		}
+
+		default: {
+			const methodName = connectionLogMethodLabels[connection_method];
+			const appLabel = app_display_name || app_name;
+			return (
+				<span>
+					{appLabel ? (
+						<>
+							{appLabel}{" "}
+							<span className="text-xs text-content-secondary">
+								({methodName})
+							</span>
+						</>
+					) : (
+						methodName
+					)}{" "}
+					session to {workspace_owner_username}'s{" "}
+					<Link asChild showExternalIcon={false} className="text-base">
+						<RouterLink to={`/@${workspace_owner_username}/${workspace_name}`}>
+							<strong>{workspace_name}</strong>
+						</RouterLink>
+					</Link>{" "}
+					workspace{" "}
 				</span>
 			);
 		}
