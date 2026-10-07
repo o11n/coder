@@ -1453,6 +1453,9 @@ func expectUpdateWorkspaceDeletedByID(assertions func(params database.UpdateWork
 					return nil
 				},
 			)
+		mTx.EXPECT().ClearWorkspaceSecretsByWorkspaceID(gomock.Any(), gomock.Any()).
+			Times(1).
+			Return(nil)
 		mTx.EXPECT().SoftDeleteWorkspaceAgentsByWorkspaceID(gomock.Any(), gomock.Any()).
 			Times(1).
 			Return(nil)
@@ -1484,7 +1487,7 @@ func withBuild(mTx *dbmock.MockStore) {
 	// secrets; with none present there is nothing to insert. Clearing older
 	// builds' rows runs on every build.
 	mTx.EXPECT().ListActiveWorkspaceSecrets(gomock.Any(), gomock.Any()).MaxTimes(1).Return(nil, nil)
-	mTx.EXPECT().ClearWorkspaceSecretsBeforeBuild(gomock.Any(), gomock.Any()).MaxTimes(1).Return(nil)
+	mTx.EXPECT().ClearWorkspaceSecretsBeforeBuild(gomock.Any(), gomock.Any()).Times(1).Return(nil)
 }
 
 // expectBuild captures a call to InsertWorkspaceBuild and runs the provided assertions
