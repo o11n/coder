@@ -5,6 +5,9 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/coder/coder/v2/agent/proto"
+	"github.com/coder/coder/v2/codersdk"
 )
 
 func TestExtractAppName(t *testing.T) {
@@ -30,6 +33,9 @@ func TestExtractAppName(t *testing.T) {
 		{"VSCode", envWith("vscode"), "", "vscode"},
 		{"JetBrainsLegacyCasing", envWith("JetBrains"), "", "jetbrains"},
 		{"UnknownTypeNormalized", envWith("Cursor-Nightly"), "", "cursor_nightly"},
+		// The method, not the app name, marks reconnecting PTY connections,
+		// so the name and its session count key stay as supplied.
+		{"WebTerminalNameKept", envWith("Reconnecting-PTY"), "", "reconnecting_pty"},
 		{"LastInstanceWins", append(envWith("vscode"), AppNameEnvironmentVariable+"=cursor"), "", "cursor"},
 		// A variable that merely starts with the same characters is a
 		// different variable, not an app name.
@@ -57,6 +63,23 @@ func TestExtractAppName(t *testing.T) {
 				require.Contains(t, filteredEnv, tc.keepEnv)
 			}
 		})
+	}
+}
+
+func TestSSHConnectionType(t *testing.T) {
+	t.Parallel()
+
+	for appName, want := range map[string]proto.Connection_Type{
+		"ssh":              proto.Connection_SSH,
+		"zed":              proto.Connection_SSH,
+		"vscode":           proto.Connection_VSCODE,
+		"cursor":           proto.Connection_VSCODE,
+		"jetbrains":        proto.Connection_JETBRAINS,
+		"some_new_ide":     proto.Connection_SSH,
+		"reconnecting_pty": proto.Connection_SSH,
+		"unknown":          proto.Connection_SSH,
+	} {
+		require.Equal(t, want, sshConnectionType(codersdk.AppNameFamily(appName)), appName)
 	}
 }
 

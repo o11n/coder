@@ -384,6 +384,21 @@ func extractAppName(env []string) (appName, rawAppName string, filteredEnv []str
 	})
 }
 
+// sshConnectionType maps an SSH app family onto the deprecated connection
+// type. Apps outside the VS Code and JetBrains families report SSH, which
+// every coderd accepts. The method, not this type, marks reconnecting PTY
+// connections.
+func sshConnectionType(family codersdk.AppFamilyName) proto.Connection_Type {
+	switch family {
+	case codersdk.AppFamilyVSCode:
+		return proto.Connection_VSCODE
+	case codersdk.AppFamilyJetBrains:
+		return proto.Connection_JETBRAINS
+	default:
+		return proto.Connection_SSH
+	}
+}
+
 // sessionCloseTracker is a wrapper around Session that tracks the exit code.
 type sessionCloseTracker struct {
 	ssh.Session
@@ -455,18 +470,12 @@ func (s *Server) sessionHandler(session ssh.Session) {
 		)
 	}
 
-	// Connection_Type is a fixed enum, stored as a database enum in the
-	// connection log, so it can only hold a family.
-	var connectionType proto.Connection_Type
-	switch family {
-	case codersdk.AppFamilySSH:
-		connectionType = proto.Connection_SSH
-	case codersdk.AppFamilyVSCode:
-		connectionType = proto.Connection_VSCODE
-	case codersdk.AppFamilyJetBrains:
-		connectionType = proto.Connection_JETBRAINS
-	default:
-		connectionType = proto.Connection_TYPE_UNSPECIFIED
+	connectionType := sshConnectionType(family)
+	// Sessions without a supplied app are counted as SSH, but their
+	// connection reports leave the app absent rather than claim one.
+	connectionAppName := appName
+	if rawAppName == "" {
+		connectionAppName = ""
 	}
 
 	// It's not safe to assume RemoteAddr() returns a non-nil value. slog.F usage is fine because it correctly
@@ -483,8 +492,9 @@ func (s *Server) sessionHandler(session ssh.Session) {
 		// Report connection attempt even if we couldn't accept it.
 		connReporter := s.config.ConnectionReporter.Connect(proto.ConnectEvent{
 			ID:              id,
+			Method:          proto.Connection_METHOD_SSH,
 			Type:            connectionType,
-			AppName:         appName,
+			AppName:         connectionAppName,
 			IP:              remoteAddrString,
 			ClientSessionID: clientSessionID,
 		})
@@ -521,8 +531,9 @@ func (s *Server) sessionHandler(session ssh.Session) {
 
 		connReporter := s.config.ConnectionReporter.Connect(proto.ConnectEvent{
 			ID:              id,
+			Method:          proto.Connection_METHOD_SSH,
 			Type:            connectionType,
-			AppName:         appName,
+			AppName:         connectionAppName,
 			IP:              remoteAddrString,
 			ClientSessionID: clientSessionID,
 		})

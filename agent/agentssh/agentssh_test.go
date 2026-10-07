@@ -41,12 +41,17 @@ type testConnectionReporter struct {
 	mu          sync.Mutex
 	connects    []proto.ConnectEvent
 	disconnects []proto.DisconnectEvent
+	// onConnect, when set, runs during Connect while the session is active.
+	onConnect func()
 }
 
 func (r *testConnectionReporter) Connect(connectEvent proto.ConnectEvent) proto.DisconnectionReporter {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.connects = append(r.connects, connectEvent)
+	if r.onConnect != nil {
+		r.onConnect()
+	}
 	return &testDisconnectionReporter{
 		callback: func(disconnectEvent proto.DisconnectEvent) {
 			r.mu.Lock()
@@ -146,6 +151,88 @@ func TestNewServer_ServeClient(t *testing.T) {
 			// disconnect inherit the connect report's ID via the closure, so they
 			// will always be the same.
 			require.Equal(t, tc.clientSessionID, reporter.connects[0].ClientSessionID, "connect client session id")
+		})
+	}
+}
+
+// The handler sets the method itself, so no client-supplied app name can
+// change it, and the deprecated type only carries families that every coderd
+// accepts. A session without a supplied app is counted as SSH but reports no
+// app.
+func TestNewServer_ReportsAppName(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name string
+		// setEnv sends env as the app name variable, even when empty.
+		setEnv   bool
+		env      string
+		appName  string
+		countKey string
+		typ      proto.Connection_Type
+	}{
+		{"NoEnv", false, "", "", "ssh", proto.Connection_SSH},
+		{"EmptyEnv", true, "", "", "ssh", proto.Connection_SSH},
+		{"ExplicitSSH", true, "ssh", "ssh", "ssh", proto.Connection_SSH},
+		{"VSCode", true, "vscode", "vscode", "vscode", proto.Connection_VSCODE},
+		{"VSCodeFork", true, "Cursor", "cursor", "cursor", proto.Connection_VSCODE},
+		{"SSHFamily", true, "zed", "zed", "zed", proto.Connection_SSH},
+		{"Unfamiliar", true, "Some-New-IDE", "some_new_ide", "some_new_ide", proto.Connection_SSH},
+		{"WebTerminalName", true, "Reconnecting-PTY", "reconnecting_pty", "reconnecting_pty", proto.Connection_SSH},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			ctx := context.Background()
+			logger := testutil.Logger(t)
+			reporter := &testConnectionReporter{}
+			s, err := agentssh.NewServer(ctx, logger,
+				prometheus.NewRegistry(),
+				afero.NewMemMapFs(),
+				agentexec.DefaultExecer,
+				&agentssh.Config{
+					ConnectionReporter: reporter,
+				},
+			)
+			require.NoError(t, err)
+			defer s.Close()
+			err = s.UpdateHostSigner(42)
+			require.NoError(t, err)
+
+			// The session is counted under the app name, or SSH without one.
+			var sessionCounts map[string]int64
+			reporter.onConnect = func() { sessionCounts = s.SessionCounts() }
+
+			ln, err := net.Listen("tcp", "127.0.0.1:0")
+			require.NoError(t, err)
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				err := s.Serve(ln)
+				assert.Error(t, err) // Server is closed.
+			}()
+
+			c := sshClient(t, ln.Addr().String())
+			sess, err := c.NewSession()
+			require.NoError(t, err)
+			if tc.setEnv {
+				err = sess.Setenv(agentssh.AppNameEnvironmentVariable, tc.env)
+				require.NoError(t, err)
+			}
+			err = sess.Run("echo hello")
+			require.NoError(t, err)
+
+			err = s.Close()
+			require.NoError(t, err)
+			<-done
+
+			require.Len(t, reporter.connects, 1)
+			require.Len(t, reporter.disconnects, 1)
+			connect := reporter.connects[0]
+			require.Equal(t, proto.Connection_METHOD_SSH, connect.Method)
+			require.Equal(t, tc.typ, connect.Type)
+			require.Equal(t, tc.appName, connect.AppName)
+			require.Equal(t, map[string]int64{tc.countKey: 1}, sessionCounts)
 		})
 	}
 }

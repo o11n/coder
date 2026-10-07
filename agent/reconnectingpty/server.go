@@ -88,6 +88,7 @@ func (s *Server) Serve(ctx, hardCtx context.Context, l net.Listener) (retErr err
 		wg.Add(1)
 		connReporter := s.connectionReporter.Connect(proto.ConnectEvent{
 			ID:              uuid.New(),
+			Method:          proto.Connection_METHOD_RECONNECTING_PTY,
 			Type:            proto.Connection_RECONNECTING_PTY,
 			IP:              remoteAddrString,
 			ClientSessionID: clientSessionID,

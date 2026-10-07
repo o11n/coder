@@ -84,6 +84,7 @@ func NewJetbrainsChannelWatcher(ctx ssh.Context, logger slog.Logger,
 func (w *JetbrainsChannelWatcher) Accept() (gossh.Channel, <-chan *gossh.Request, error) {
 	connReporter := w.connectionReporter.Connect(proto.ConnectEvent{
 		ID:              uuid.New(),
+		Method:          proto.Connection_METHOD_SSH,
 		Type:            proto.Connection_JETBRAINS,
 		AppName:         string(codersdk.AppFamilyJetBrains),
 		IP:              w.originAddr,

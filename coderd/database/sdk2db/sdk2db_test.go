@@ -113,3 +113,86 @@ func TestConnectionLogFromAgentType(t *testing.T) {
 	_, _, err := sdk2db.ConnectionLogFromAgentType(agentproto.Connection_Type(1000))
 	require.Error(t, err)
 }
+
+func TestConnectionLogFromAgentConnection(t *testing.T) {
+	t.Parallel()
+
+	const (
+		ssh  = database.ConnectionLogMethodSSH
+		pty  = database.ConnectionLogMethodReconnectingPTY
+		port = database.ConnectionLogMethodPortForwarding
+	)
+	unknownType := agentproto.Connection_Type(1000)
+	for _, tc := range []struct {
+		name    string
+		method  agentproto.Connection_Method
+		typ     agentproto.Connection_Type
+		appName string
+		want    database.ConnectionLogMethod
+		wantApp string
+	}{
+		// Current agents send the method, the app, and a legacy type.
+		{"SSH", agentproto.Connection_METHOD_SSH, agentproto.Connection_SSH, "ssh", ssh, "ssh"},
+		{"VSCodeFork", agentproto.Connection_METHOD_SSH, agentproto.Connection_VSCODE, "cursor", ssh, "cursor"},
+		{"Unfamiliar", agentproto.Connection_METHOD_SSH, agentproto.Connection_SSH, "Some-New-IDE", ssh, "some_new_ide"},
+		{"WhitespaceName", agentproto.Connection_METHOD_SSH, agentproto.Connection_SSH, "  ", ssh, "unknown"},
+		// An SSH client naming reconnecting_pty stays SSH.
+		{"SSHClaimsWebTerminal", agentproto.Connection_METHOD_SSH, agentproto.Connection_SSH, "reconnecting_pty", ssh, "reconnecting_pty"},
+		{"SSHIgnoresPTYType", agentproto.Connection_METHOD_SSH, agentproto.Connection_RECONNECTING_PTY, "", ssh, ""},
+		{"SSHRecoversVSCode", agentproto.Connection_METHOD_SSH, agentproto.Connection_VSCODE, "", ssh, "vscode"},
+		{"SSHRecoversJetBrains", agentproto.Connection_METHOD_SSH, agentproto.Connection_JETBRAINS, "", ssh, "jetbrains"},
+		{"SSHWithoutApp", agentproto.Connection_METHOD_SSH, agentproto.Connection_SSH, "", ssh, ""},
+		{"SSHIgnoresUnknownType", agentproto.Connection_METHOD_SSH, unknownType, "", ssh, ""},
+		{"WebTerminal", agentproto.Connection_METHOD_RECONNECTING_PTY, agentproto.Connection_RECONNECTING_PTY, "", pty, ""},
+		{"WebTerminalDoesNotRecover", agentproto.Connection_METHOD_RECONNECTING_PTY, agentproto.Connection_VSCODE, "", pty, ""},
+		{"WebTerminalApp", agentproto.Connection_METHOD_RECONNECTING_PTY, agentproto.Connection_RECONNECTING_PTY, "Some-App", pty, "some_app"},
+		// Port forwarding never falls back to the legacy type, and the app
+		// name is not stored where the destination belongs.
+		{"PortForwarding", agentproto.Connection_METHOD_PORT_FORWARDING, agentproto.Connection_TYPE_UNSPECIFIED, "", port, ""},
+		{"PortForwardingIgnoresSSHType", agentproto.Connection_METHOD_PORT_FORWARDING, agentproto.Connection_SSH, "ssh", port, ""},
+		{"PortForwardingDoesNotRecover", agentproto.Connection_METHOD_PORT_FORWARDING, agentproto.Connection_VSCODE, "", port, ""},
+		{"PortForwardingIgnoresAppName", agentproto.Connection_METHOD_PORT_FORWARDING, agentproto.Connection_TYPE_UNSPECIFIED, "8080", port, ""},
+		// Agents without connection_method send only the type.
+		{"LegacySSH", agentproto.Connection_METHOD_UNSPECIFIED, agentproto.Connection_SSH, "", ssh, ""},
+		{"LegacyUnspecified", agentproto.Connection_METHOD_UNSPECIFIED, agentproto.Connection_TYPE_UNSPECIFIED, "", ssh, ""},
+		{"LegacyVSCode", agentproto.Connection_METHOD_UNSPECIFIED, agentproto.Connection_VSCODE, "", ssh, "vscode"},
+		{"LegacyJetBrains", agentproto.Connection_METHOD_UNSPECIFIED, agentproto.Connection_JETBRAINS, "", ssh, "jetbrains"},
+		{"LegacyPTY", agentproto.Connection_METHOD_UNSPECIFIED, agentproto.Connection_RECONNECTING_PTY, "", pty, ""},
+		{"LegacyWithAppName", agentproto.Connection_METHOD_UNSPECIFIED, agentproto.Connection_VSCODE, "Cursor", ssh, "cursor"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			method, appName, err := sdk2db.ConnectionLogFromAgentConnection(&agentproto.Connection{
+				ConnectionMethod: tc.method,
+				Type:             tc.typ,
+				AppName:          tc.appName,
+			})
+			require.NoError(t, err)
+			require.Equal(t, tc.want, method)
+			require.Equal(t, tc.wantApp, appName)
+		})
+	}
+
+	// Unknown methods are rejected before the legacy type is read, so none is
+	// recorded as SSH.
+	for _, method := range []agentproto.Connection_Method{
+		agentproto.Connection_Method(4),
+		agentproto.Connection_Method(42),
+	} {
+		for _, typ := range []agentproto.Connection_Type{
+			agentproto.Connection_TYPE_UNSPECIFIED,
+			agentproto.Connection_SSH,
+			agentproto.Connection_VSCODE,
+		} {
+			_, _, err := sdk2db.ConnectionLogFromAgentConnection(&agentproto.Connection{
+				ConnectionMethod: method,
+				Type:             typ,
+				AppName:          "ssh",
+			})
+			require.Error(t, err, "method %d type %s", method, typ)
+		}
+	}
+
+	_, _, err := sdk2db.ConnectionLogFromAgentConnection(&agentproto.Connection{Type: unknownType})
+	require.Error(t, err)
+}

@@ -386,15 +386,31 @@ message Connection {
 		JETBRAINS = 3;
 		RECONNECTING_PTY = 4;
 	}
+	// How the client reached the agent. Values are prefixed because enum
+	// values share the Connection scope with Type.
+	enum Method {
+		METHOD_UNSPECIFIED = 0;
+		METHOD_SSH = 1;
+		METHOD_RECONNECTING_PTY = 2;
+		// Reserved for port forwarding reports, which agents do not send yet.
+		METHOD_PORT_FORWARDING = 3;
+	}
 
 	bytes id = 1;
 	Action action = 2;
-	Type type = 3;
+	// Superseded by connection_method and app_name. Agents still send it for
+	// coderd that predates them: SSH maps VS Code and JetBrains apps to their
+	// family and any other app to SSH.
+	Type type = 3 [deprecated = true];
 	google.protobuf.Timestamp timestamp = 4;
 	string ip = 5;
 	int32 status_code = 6;
 	optional string reason = 7;
 	string client_session_id = 8;
+	// The app that connected, such as "cursor". Empty when the agent does not
+	// know the app.
+	string app_name = 9;
+	Method connection_method = 10;
 }
 
 message ReportConnectionRequest {

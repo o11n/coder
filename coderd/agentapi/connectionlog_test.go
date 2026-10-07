@@ -45,6 +45,8 @@ func TestConnectionLog(t *testing.T) {
 		id              uuid.UUID
 		action          *agentproto.Connection_Action
 		typ             *agentproto.Connection_Type
+		reqMethod       agentproto.Connection_Method
+		reqAppName      string
 		method          database.ConnectionLogMethod
 		appName         string
 		time            time.Time
@@ -130,6 +132,89 @@ func TestConnectionLog(t *testing.T) {
 			appName: "vscode",
 			time:    dbtime.Now(),
 		},
+		// Current agents send the method and app next to the legacy type,
+		// identically on connect and disconnect.
+		{
+			name:            "Unfamiliar App Connect",
+			id:              uuid.New(),
+			action:          agentproto.Connection_CONNECT.Enum(),
+			typ:             agentproto.Connection_SSH.Enum(),
+			reqMethod:       agentproto.Connection_METHOD_SSH,
+			reqAppName:      "Some-New-IDE",
+			method:          database.ConnectionLogMethodSSH,
+			appName:         "some_new_ide",
+			time:            dbtime.Now(),
+			clientSessionID: "0123456789abcdef0123456789abcdef",
+		},
+		{
+			name:            "Unfamiliar App Disconnect",
+			id:              uuid.New(),
+			action:          agentproto.Connection_DISCONNECT.Enum(),
+			typ:             agentproto.Connection_SSH.Enum(),
+			reqMethod:       agentproto.Connection_METHOD_SSH,
+			reqAppName:      "Some-New-IDE",
+			method:          database.ConnectionLogMethodSSH,
+			appName:         "some_new_ide",
+			time:            dbtime.Now(),
+			reason:          "because",
+			clientSessionID: "0123456789abcdef0123456789abcdef",
+		},
+		{
+			name:       "VS Code Fork Connect",
+			id:         uuid.New(),
+			action:     agentproto.Connection_CONNECT.Enum(),
+			typ:        agentproto.Connection_VSCODE.Enum(),
+			reqMethod:  agentproto.Connection_METHOD_SSH,
+			reqAppName: "cursor",
+			method:     database.ConnectionLogMethodSSH,
+			appName:    "cursor",
+			time:       dbtime.Now(),
+		},
+		{
+			// Only the method marks reconnecting PTY connections.
+			name:       "SSH Claims Web Terminal",
+			id:         uuid.New(),
+			action:     agentproto.Connection_CONNECT.Enum(),
+			typ:        agentproto.Connection_SSH.Enum(),
+			reqMethod:  agentproto.Connection_METHOD_SSH,
+			reqAppName: "reconnecting_pty",
+			method:     database.ConnectionLogMethodSSH,
+			appName:    "reconnecting_pty",
+			time:       dbtime.Now(),
+		},
+		{
+			name:      "Web Terminal Disconnect",
+			id:        uuid.New(),
+			action:    agentproto.Connection_DISCONNECT.Enum(),
+			typ:       agentproto.Connection_RECONNECTING_PTY.Enum(),
+			reqMethod: agentproto.Connection_METHOD_RECONNECTING_PTY,
+			method:    database.ConnectionLogMethodReconnectingPTY,
+			time:      dbtime.Now(),
+			status:    1,
+		},
+		// Port forwarding keeps its method whatever the legacy type, and the
+		// app name is not stored where the destination belongs.
+		{
+			name:            "Port Forwarding Connect",
+			id:              uuid.New(),
+			action:          agentproto.Connection_CONNECT.Enum(),
+			typ:             agentproto.Connection_SSH.Enum(),
+			reqMethod:       agentproto.Connection_METHOD_PORT_FORWARDING,
+			reqAppName:      "Some-App",
+			method:          database.ConnectionLogMethodPortForwarding,
+			time:            dbtime.Now(),
+			clientSessionID: "0123456789abcdef0123456789abcdef",
+		},
+		{
+			name:      "Port Forwarding Disconnect",
+			id:        uuid.New(),
+			action:    agentproto.Connection_DISCONNECT.Enum(),
+			typ:       agentproto.Connection_TYPE_UNSPECIFIED.Enum(),
+			reqMethod: agentproto.Connection_METHOD_PORT_FORWARDING,
+			method:    database.ConnectionLogMethodPortForwarding,
+			time:      dbtime.Now(),
+			reason:    "because",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -149,14 +234,16 @@ func TestConnectionLog(t *testing.T) {
 			}
 			_, err := api.ReportConnection(context.Background(), &agentproto.ReportConnectionRequest{
 				Connection: &agentproto.Connection{
-					Id:              tt.id[:],
-					Action:          *tt.action,
-					Type:            *tt.typ,
-					Timestamp:       timestamppb.New(tt.time),
-					Ip:              tt.ip,
-					StatusCode:      tt.status,
-					Reason:          &tt.reason,
-					ClientSessionId: tt.clientSessionID,
+					Id:               tt.id[:],
+					Action:           *tt.action,
+					Type:             *tt.typ,
+					Timestamp:        timestamppb.New(tt.time),
+					Ip:               tt.ip,
+					StatusCode:       tt.status,
+					Reason:           &tt.reason,
+					ClientSessionId:  tt.clientSessionID,
+					AppName:          tt.reqAppName,
+					ConnectionMethod: tt.reqMethod,
 				},
 			})
 			require.NoError(t, err)
@@ -208,29 +295,44 @@ func TestConnectionLog(t *testing.T) {
 	}
 }
 
-// An agent connection type this coderd does not know is rejected rather than
-// logged with a guessed method.
+// An agent connection type or method this coderd does not know is rejected
+// rather than logged with a guessed method.
 func TestConnectionLogRejectsUnknownType(t *testing.T) {
 	t.Parallel()
 
-	connLogger := connectionlog.NewFake()
-	api := &agentapi.ConnLogAPI{
-		ConnectionLogger: asAtomicPointer[connectionlog.ConnectionLogger](connLogger),
-		Database:         dbmock.NewMockStore(gomock.NewController(t)),
-		AgentID:          uuid.New(),
-		Workspace:        &agentapi.CachedWorkspaceFields{},
+	for _, tc := range []struct {
+		name   string
+		typ    agentproto.Connection_Type
+		method agentproto.Connection_Method
+	}{
+		{"UnknownType", agentproto.Connection_Type(1000), agentproto.Connection_METHOD_UNSPECIFIED},
+		{"UnknownMethod", agentproto.Connection_SSH, agentproto.Connection_Method(42)},
+		{"UnknownMethodUnspecifiedType", agentproto.Connection_TYPE_UNSPECIFIED, agentproto.Connection_Method(4)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			connLogger := connectionlog.NewFake()
+			api := &agentapi.ConnLogAPI{
+				ConnectionLogger: asAtomicPointer[connectionlog.ConnectionLogger](connLogger),
+				Database:         dbmock.NewMockStore(gomock.NewController(t)),
+				AgentID:          uuid.New(),
+				Workspace:        &agentapi.CachedWorkspaceFields{},
+			}
+			id := uuid.New()
+			_, err := api.ReportConnection(context.Background(), &agentproto.ReportConnectionRequest{
+				Connection: &agentproto.Connection{
+					Id:               id[:],
+					Action:           agentproto.Connection_CONNECT,
+					Type:             tc.typ,
+					ConnectionMethod: tc.method,
+					Timestamp:        timestamppb.New(dbtime.Now()),
+				},
+			})
+			require.Error(t, err)
+			require.Empty(t, connLogger.ConnectionLogs())
+		})
 	}
-	id := uuid.New()
-	_, err := api.ReportConnection(context.Background(), &agentproto.ReportConnectionRequest{
-		Connection: &agentproto.Connection{
-			Id:        id[:],
-			Action:    agentproto.Connection_CONNECT,
-			Type:      agentproto.Connection_Type(1000),
-			Timestamp: timestamppb.New(dbtime.Now()),
-		},
-	})
-	require.Error(t, err)
-	require.Empty(t, connLogger.ConnectionLogs())
 }
 
 func agentProtoConnectionActionToConnectionLog(t *testing.T, action agentproto.Connection_Action) database.ConnectionStatus {

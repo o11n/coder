@@ -169,6 +169,7 @@ func TestAgent_SSHUpgrade(t *testing.T) {
 
 			assertConnectionReport(t, client,
 				proto.ConnectEvent{
+					Method:          proto.Connection_METHOD_SSH,
 					Type:            proto.Connection_SSH,
 					ClientSessionID: tc.expect,
 				},
@@ -233,6 +234,7 @@ func TestAgent_ReconnectingPTYUpgrade(t *testing.T) {
 
 			assertConnectionReport(t, client,
 				proto.ConnectEvent{
+					Method:          proto.Connection_METHOD_RECONNECTING_PTY,
 					Type:            proto.Connection_RECONNECTING_PTY,
 					ClientSessionID: tc.expect,
 				},
