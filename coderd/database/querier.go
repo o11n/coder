@@ -920,7 +920,9 @@ type sqlcQuerier interface {
 	// workspaces in a given timeframe. The template IDs, active users, and
 	// usage_seconds all reflect any usage in the template, including apps.
 	//
-	// Session usage comes out per app name; callers group the names into families.
+	// Session usage comes out per reported app name, separate from workspace apps.
+	// Every registered app is listed; unregistered apps past
+	// @max_unregistered_apps fold into the overflow accounting row.
 	//
 	// When combining data from multiple templates, we must make a guess at
 	// how the user behaved for the 30 minute interval. In this case we make
@@ -936,8 +938,12 @@ type sqlcQuerier interface {
 	// GetTemplateInsightsByTemplate is used for Prometheus metrics. Keep
 	// in sync with GetTemplateInsights and UpsertTemplateUsageStats.
 	//
-	// Session usage comes out per app name, as in GetTemplateInsights, so either
-	// query reports the same family totals once the names are grouped.
+	// Session usage comes out per family, counted from the raw agent stats: a
+	// minute counts once per user and family however many of the family's apps
+	// were open. The rollup keeps minutes per app only, so summing its app rows
+	// would count overlapping apps of one family twice. The caller passes the
+	// registry's app-to-family mapping as two parallel arrays; an app name it does
+	// not list falls under unknown, so the output keys stay within the families.
 	GetTemplateInsightsByTemplate(ctx context.Context, arg GetTemplateInsightsByTemplateParams) ([]GetTemplateInsightsByTemplateRow, error)
 	// GetTemplateParameterInsights does for each template in a given timeframe,
 	// look for the latest workspace build (for every workspace) that has been

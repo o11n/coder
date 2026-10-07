@@ -19133,23 +19133,118 @@ WITH
 			app_usage_by_template
 		GROUP BY
 			app_name
+	),
+	-- The response lists every registered app, the unknown accounting row,
+	-- and the @max_unregistered_apps busiest unregistered apps. The rest fold
+	-- into the overflow accounting row, together with the minutes stored
+	-- under overflow. Only the response folds; storage keeps every app.
+	unregistered_ranks AS (
+		SELECT
+			app_name,
+			row_number() OVER (ORDER BY usage_seconds DESC, app_name COLLATE "C") AS rank
+		FROM
+			app_usage
+		WHERE
+			NOT (app_name = ANY(COALESCE($4::text[], '{}'::text[])))
+			AND app_name NOT IN ('unknown', 'overflow')
+	),
+	folded_apps AS (
+		SELECT
+			app_name
+		FROM
+			unregistered_ranks
+		WHERE
+			rank > $5::bigint
+	),
+	folded_names AS (
+		SELECT app_name FROM folded_apps
+		UNION ALL
+		SELECT app_name FROM app_usage WHERE app_name = 'overflow'
+	),
+	-- Which minutes the folded apps shared is not stored, so their sum per
+	-- user and half hour is capped at that user's active minutes. The result
+	-- is an upper bound on the minutes any of them was open. The EXISTS skips
+	-- the scan when nothing folds.
+	folded_minutes AS (
+		SELECT
+			sessions.start_time,
+			sessions.user_id,
+			SUM(sessions.usage_mins) AS usage_mins
+		FROM
+			template_usage_stats_session_apps AS sessions
+		WHERE
+			EXISTS (SELECT 1 FROM folded_apps)
+			AND sessions.start_time >= $1::timestamptz
+			AND sessions.start_time <= ($2::timestamptz) - '30 minutes'::interval
+			AND CASE WHEN COALESCE(array_length($3::uuid[], 1), 0) > 0 THEN sessions.template_id = ANY($3::uuid[]) ELSE TRUE END
+			AND sessions.app_name IN (SELECT app_name FROM folded_names)
+		GROUP BY
+			sessions.start_time, sessions.user_id
+	),
+	response_app_usage AS (
+		SELECT
+			app_name,
+			usage_seconds
+		FROM
+			app_usage
+		WHERE
+			app_name NOT IN (SELECT app_name FROM folded_apps)
+			AND NOT (app_name = 'overflow' AND EXISTS (SELECT 1 FROM folded_apps))
+		UNION ALL
+		SELECT
+			'overflow',
+			(SUM(LEAST(folded.usage_mins, users.usage_mins)) * 60)::bigint
+		FROM
+			folded_minutes AS folded
+		JOIN
+			users
+		ON
+			users.start_time = folded.start_time
+			AND users.user_id = folded.user_id
+		HAVING
+			COUNT(*) > 0
+	),
+	response_app_templates AS (
+		SELECT
+			app_name,
+			template_ids
+		FROM
+			app_templates
+		WHERE
+			app_name NOT IN (SELECT app_name FROM folded_apps)
+			AND NOT (app_name = 'overflow' AND EXISTS (SELECT 1 FROM folded_apps))
+		UNION ALL
+		SELECT
+			'overflow',
+			array_agg(DISTINCT template_id)
+		FROM
+			app_usage_by_template
+		WHERE
+			app_name IN (SELECT app_name FROM folded_names)
+		HAVING
+			EXISTS (SELECT 1 FROM folded_apps)
 	)
 
 SELECT
 	COALESCE((SELECT array_agg(DISTINCT template_id) FROM base WHERE NOT is_user_row), '{}')::uuid[] AS template_ids, -- Includes app usage.
 	COALESCE(COUNT(DISTINCT user_id), 0)::bigint AS active_users, -- Includes app usage.
 	COALESCE(SUM(usage_mins) * 60, 0)::bigint AS usage_total_seconds, -- Includes app usage.
-	-- Keyed by app name; callers fold both into families.
-	COALESCE((SELECT jsonb_object_agg(app_name, usage_seconds) FROM app_usage), '{}'::jsonb)::jsonb AS session_app_usage_seconds,
-	COALESCE((SELECT jsonb_object_agg(app_name, template_ids) FROM app_templates), '{}'::jsonb)::jsonb AS session_app_template_ids
+	-- Keyed by reported app name, retaining each listed app's own minutes.
+	COALESCE((SELECT jsonb_object_agg(app_name, usage_seconds) FROM response_app_usage), '{}'::jsonb)::jsonb AS session_app_usage_seconds,
+	COALESCE((SELECT jsonb_object_agg(app_name, template_ids) FROM response_app_templates), '{}'::jsonb)::jsonb AS session_app_template_ids,
+	-- Unregistered apps folded into overflow, whose seconds are then an
+	-- upper bound.
+	(SELECT COUNT(*) FROM folded_apps)::bigint AS session_folded_app_count
 FROM
 	users
 `
 
 type GetTemplateInsightsParams struct {
-	StartTime   time.Time   `db:"start_time" json:"start_time"`
-	EndTime     time.Time   `db:"end_time" json:"end_time"`
-	TemplateIDs []uuid.UUID `db:"template_ids" json:"template_ids"`
+	StartTime           time.Time   `db:"start_time" json:"start_time"`
+	EndTime             time.Time   `db:"end_time" json:"end_time"`
+	TemplateIDs         []uuid.UUID `db:"template_ids" json:"template_ids"`
+	RegisteredAppNames  []string    `db:"registered_app_names" json:"registered_app_names"`
+	MaxUnregisteredApps int64       `db:"max_unregistered_apps" json:"max_unregistered_apps"`
 }
 
 type GetTemplateInsightsRow struct {
@@ -19158,13 +19253,16 @@ type GetTemplateInsightsRow struct {
 	UsageTotalSeconds      int64           `db:"usage_total_seconds" json:"usage_total_seconds"`
 	SessionAppUsageSeconds json.RawMessage `db:"session_app_usage_seconds" json:"session_app_usage_seconds"`
 	SessionAppTemplateIds  json.RawMessage `db:"session_app_template_ids" json:"session_app_template_ids"`
+	SessionFoldedAppCount  int64           `db:"session_folded_app_count" json:"session_folded_app_count"`
 }
 
 // GetTemplateInsights returns the aggregate user-produced usage of all
 // workspaces in a given timeframe. The template IDs, active users, and
 // usage_seconds all reflect any usage in the template, including apps.
 //
-// Session usage comes out per app name; callers group the names into families.
+// Session usage comes out per reported app name, separate from workspace apps.
+// Every registered app is listed; unregistered apps past
+// @max_unregistered_apps fold into the overflow accounting row.
 //
 // When combining data from multiple templates, we must make a guess at
 // how the user behaved for the 30 minute interval. In this case we make
@@ -19172,7 +19270,13 @@ type GetTemplateInsightsRow struct {
 // they did so sequentially, thus we sum the usage up to a maximum of
 // 30 minutes with LEAST(SUM(n), 30).
 func (q *sqlQuerier) GetTemplateInsights(ctx context.Context, arg GetTemplateInsightsParams) (GetTemplateInsightsRow, error) {
-	row := q.db.QueryRowContext(ctx, getTemplateInsights, arg.StartTime, arg.EndTime, pq.Array(arg.TemplateIDs))
+	row := q.db.QueryRowContext(ctx, getTemplateInsights,
+		arg.StartTime,
+		arg.EndTime,
+		pq.Array(arg.TemplateIDs),
+		pq.Array(arg.RegisteredAppNames),
+		arg.MaxUnregisteredApps,
+	)
 	var i GetTemplateInsightsRow
 	err := row.Scan(
 		pq.Array(&i.TemplateIDs),
@@ -19180,6 +19284,7 @@ func (q *sqlQuerier) GetTemplateInsights(ctx context.Context, arg GetTemplateIns
 		&i.UsageTotalSeconds,
 		&i.SessionAppUsageSeconds,
 		&i.SessionAppTemplateIds,
+		&i.SessionFoldedAppCount,
 	)
 	return i, err
 }
@@ -19273,6 +19378,11 @@ func (q *sqlQuerier) GetTemplateInsightsByInterval(ctx context.Context, arg GetT
 
 const getTemplateInsightsByTemplate = `-- name: GetTemplateInsightsByTemplate :many
 WITH
+	registry AS (
+		SELECT
+			unnest($1::text[]) AS registered_name,
+			unnest($2::text[]) AS family
+	),
 	connected AS (
 		-- NOTE(mafredri): connection_count covers one report interval, while
 		-- the session counts are a gauge, so an idle session reports none.
@@ -19285,8 +19395,8 @@ WITH
 		FROM
 			workspace_agent_stats
 		WHERE
-			created_at >= $1::timestamptz
-			AND created_at < $2::timestamptz
+			created_at >= $3::timestamptz
+			AND created_at < $4::timestamptz
 			AND session_counts <> '{}'::jsonb
 		GROUP BY
 			template_id, user_id
@@ -19294,14 +19404,14 @@ WITH
 			BOOL_OR(connection_count > 0)
 	),
 	insights AS (
-		-- A minute counts once per app however many of its sessions were open,
-		-- which COUNT(DISTINCT) does in the grouping. Deduplicating the
+		-- A minute counts once per family however many of its sessions were
+		-- open, which COUNT(DISTINCT) does in the grouping. Deduplicating the
 		-- expanded rows first instead spills to disk once a deployment has a
 		-- few thousand agents.
 		SELECT
 			was.template_id,
 			was.user_id,
-			app_name,
+			COALESCE(registry.family, 'unknown') AS family,
 			COUNT(DISTINCT date_trunc('minute', was.created_at)) AS usage_mins
 		FROM
 			workspace_agent_stats AS was
@@ -19312,27 +19422,31 @@ WITH
 		ON
 			c.template_id = was.template_id
 			AND c.user_id = was.user_id
+		LEFT JOIN
+			registry
+		ON
+			registry.registered_name = app_name
 		WHERE
-			was.created_at >= $1::timestamptz
-			AND was.created_at < $2::timestamptz
+			was.created_at >= $3::timestamptz
+			AND was.created_at < $4::timestamptz
 			AND was.session_counts <> '{}'::jsonb
 		GROUP BY
-			was.template_id, was.user_id, app_name
+			was.template_id, was.user_id, COALESCE(registry.family, 'unknown')
 	),
-	app_usage AS (
+	family_usage AS (
 		SELECT
 			template_id,
-			jsonb_object_agg(app_name, usage_seconds) AS session_app_usage_seconds
+			jsonb_object_agg(family, usage_seconds) AS session_family_usage_seconds
 		FROM (
 			SELECT
 				template_id,
-				app_name,
+				family,
 				(SUM(usage_mins) * 60)::bigint AS usage_seconds
 			FROM
 				insights
 			GROUP BY
-				template_id, app_name
-		) AS app_seconds
+				template_id, family
+		) AS family_seconds
 		GROUP BY
 			template_id
 	),
@@ -19349,35 +19463,46 @@ WITH
 SELECT
 	active_users.template_id,
 	active_users.active_users,
-	app_usage.session_app_usage_seconds
+	family_usage.session_family_usage_seconds
 FROM
 	active_users
 JOIN
-	-- Every counted template has at least one app; both sides come from
+	-- Every counted template has at least one family; both sides come from
 	-- insights.
-	app_usage
+	family_usage
 ON
-	app_usage.template_id = active_users.template_id
+	family_usage.template_id = active_users.template_id
 `
 
 type GetTemplateInsightsByTemplateParams struct {
-	StartTime time.Time `db:"start_time" json:"start_time"`
-	EndTime   time.Time `db:"end_time" json:"end_time"`
+	AppNames    []string  `db:"app_names" json:"app_names"`
+	AppFamilies []string  `db:"app_families" json:"app_families"`
+	StartTime   time.Time `db:"start_time" json:"start_time"`
+	EndTime     time.Time `db:"end_time" json:"end_time"`
 }
 
 type GetTemplateInsightsByTemplateRow struct {
-	TemplateID             uuid.UUID      `db:"template_id" json:"template_id"`
-	ActiveUsers            int64          `db:"active_users" json:"active_users"`
-	SessionAppUsageSeconds StringMapOfInt `db:"session_app_usage_seconds" json:"session_app_usage_seconds"`
+	TemplateID                uuid.UUID      `db:"template_id" json:"template_id"`
+	ActiveUsers               int64          `db:"active_users" json:"active_users"`
+	SessionFamilyUsageSeconds StringMapOfInt `db:"session_family_usage_seconds" json:"session_family_usage_seconds"`
 }
 
 // GetTemplateInsightsByTemplate is used for Prometheus metrics. Keep
 // in sync with GetTemplateInsights and UpsertTemplateUsageStats.
 //
-// Session usage comes out per app name, as in GetTemplateInsights, so either
-// query reports the same family totals once the names are grouped.
+// Session usage comes out per family, counted from the raw agent stats: a
+// minute counts once per user and family however many of the family's apps
+// were open. The rollup keeps minutes per app only, so summing its app rows
+// would count overlapping apps of one family twice. The caller passes the
+// registry's app-to-family mapping as two parallel arrays; an app name it does
+// not list falls under unknown, so the output keys stay within the families.
 func (q *sqlQuerier) GetTemplateInsightsByTemplate(ctx context.Context, arg GetTemplateInsightsByTemplateParams) ([]GetTemplateInsightsByTemplateRow, error) {
-	rows, err := q.db.QueryContext(ctx, getTemplateInsightsByTemplate, arg.StartTime, arg.EndTime)
+	rows, err := q.db.QueryContext(ctx, getTemplateInsightsByTemplate,
+		pq.Array(arg.AppNames),
+		pq.Array(arg.AppFamilies),
+		arg.StartTime,
+		arg.EndTime,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -19385,7 +19510,7 @@ func (q *sqlQuerier) GetTemplateInsightsByTemplate(ctx context.Context, arg GetT
 	var items []GetTemplateInsightsByTemplateRow
 	for rows.Next() {
 		var i GetTemplateInsightsByTemplateRow
-		if err := rows.Scan(&i.TemplateID, &i.ActiveUsers, &i.SessionAppUsageSeconds); err != nil {
+		if err := rows.Scan(&i.TemplateID, &i.ActiveUsers, &i.SessionFamilyUsageSeconds); err != nil {
 			return nil, err
 		}
 		items = append(items, i)

@@ -2,6 +2,7 @@ package insights
 
 import (
 	"context"
+	"maps"
 	"slices"
 	"sync/atomic"
 	"time"
@@ -62,6 +63,9 @@ type parameterRow struct {
 var _ prometheus.Collector = new(MetricsCollector)
 
 func NewMetricsCollector(db database.Store, logger slog.Logger, timeWindow time.Duration, tickInterval time.Duration) (*MetricsCollector, error) {
+	// The session family series read raw agent stats, which dbpurge keeps
+	// until a day behind the latest template usage rollup, so a window longer
+	// than about a day would undercount them.
 	if timeWindow == 0 {
 		timeWindow = 5 * time.Minute
 	}
@@ -104,9 +108,12 @@ func (mc *MetricsCollector) Run(ctx context.Context) (func(), error) {
 		var paramInsights []parameterRow
 
 		eg.Go(func() error {
+			appNames, appFamilies := registryFamilies()
 			rows, err := mc.database.GetTemplateInsightsByTemplate(egCtx, database.GetTemplateInsightsByTemplateParams{
-				StartTime: startTime,
-				EndTime:   endTime,
+				AppNames:    appNames,
+				AppFamilies: appFamilies,
+				StartTime:   startTime,
+				EndTime:     endTime,
 			})
 			if err != nil {
 				mc.logger.Error(ctx, "unable to fetch template insights from database", slog.Error(err))
@@ -234,33 +241,16 @@ func (mc *MetricsCollector) Collect(metricsCh chan<- prometheus.Metric) {
 			appRow.DisplayName, appRow.SlugOrPort, data.organizationNames[appRow.TemplateID])
 	}
 
-	// Built-in apps
+	// Built-in apps, one series per session family.
 	for _, templateRow := range data.templates {
 		orgName := data.organizationNames[templateRow.templateID]
-
-		metricsCh <- prometheus.MustNewConstMetric(applicationsUsageSecondsDesc, prometheus.GaugeValue,
-			float64(templateRow.usageSecondsByFamily[codersdk.AppFamilyVSCode]),
-			data.templateNames[templateRow.templateID],
-			codersdk.TemplateBuiltinAppDisplayNameVSCode,
-			"", orgName)
-
-		metricsCh <- prometheus.MustNewConstMetric(applicationsUsageSecondsDesc, prometheus.GaugeValue,
-			float64(templateRow.usageSecondsByFamily[codersdk.AppFamilyJetBrains]),
-			data.templateNames[templateRow.templateID],
-			codersdk.TemplateBuiltinAppDisplayNameJetBrains,
-			"", orgName)
-
-		metricsCh <- prometheus.MustNewConstMetric(applicationsUsageSecondsDesc, prometheus.GaugeValue,
-			float64(templateRow.usageSecondsByFamily[codersdk.AppFamilyReconnectingPTY]),
-			data.templateNames[templateRow.templateID],
-			codersdk.TemplateBuiltinAppDisplayNameWebTerminal,
-			"", orgName)
-
-		metricsCh <- prometheus.MustNewConstMetric(applicationsUsageSecondsDesc, prometheus.GaugeValue,
-			float64(templateRow.usageSecondsByFamily[codersdk.AppFamilySSH]),
-			data.templateNames[templateRow.templateID],
-			codersdk.TemplateBuiltinAppDisplayNameSSH,
-			"", orgName)
+		for _, series := range familySeries {
+			metricsCh <- prometheus.MustNewConstMetric(applicationsUsageSecondsDesc, prometheus.GaugeValue,
+				float64(templateRow.usageSecondsByFamily[series.family]),
+				data.templateNames[templateRow.templateID],
+				series.applicationName,
+				"", orgName)
+		}
 	}
 
 	// Templates
@@ -305,15 +295,47 @@ func onlyTemplateNames(templates []database.Template) map[uuid.UUID]string {
 	return m
 }
 
-// convertTemplateInsights groups each row's per-app session usage into
-// families.
+// familySeries lists the session families the application usage metric
+// reports, so the series stay bounded however many app names agents report.
+// Template apps have their own series.
+var familySeries = []struct {
+	family          codersdk.AppFamilyName
+	applicationName string
+}{
+	{codersdk.AppFamilyVSCode, codersdk.TemplateBuiltinAppDisplayNameVSCode},
+	{codersdk.AppFamilyJetBrains, codersdk.TemplateBuiltinAppDisplayNameJetBrains},
+	{codersdk.AppFamilyReconnectingPTY, codersdk.TemplateBuiltinAppDisplayNameWebTerminal},
+	{codersdk.AppFamilySSH, codersdk.TemplateBuiltinAppDisplayNameSSH},
+	// No Coder client reports sftp, but any client may supply the name.
+	{codersdk.AppFamilySFTP, codersdk.TemplateBuiltinAppDisplayNameSFTP},
+	{codersdk.AppFamilyPortForwarding, codersdk.TemplateBuiltinAppDisplayNamePortForwarding},
+	{codersdk.AppFamilyUnknown, codersdk.TemplateBuiltinAppDisplayNameUnknown},
+}
+
+// registryFamilies returns the registry's app-to-family mapping as the
+// parallel arrays GetTemplateInsightsByTemplate takes.
+func registryFamilies() (appNames, appFamilies []string) {
+	registry := codersdk.SessionCountAppFamilies()
+	appNames = slices.Sorted(maps.Keys(registry))
+	appFamilies = make([]string, 0, len(appNames))
+	for _, appName := range appNames {
+		appFamilies = append(appFamilies, string(registry[appName]))
+	}
+	return appNames, appFamilies
+}
+
+// convertTemplateInsights decodes each row's per-family session usage.
 func convertTemplateInsights(rows []database.GetTemplateInsightsByTemplateRow) []templateInsightsRow {
 	converted := make([]templateInsightsRow, 0, len(rows))
 	for _, row := range rows {
+		usageSecondsByFamily := make(map[codersdk.AppFamilyName]int64, len(row.SessionFamilyUsageSeconds))
+		for family, seconds := range row.SessionFamilyUsageSeconds {
+			usageSecondsByFamily[codersdk.AppFamilyName(family)] = seconds
+		}
 		converted = append(converted, templateInsightsRow{
 			templateID:           row.TemplateID,
 			activeUsers:          row.ActiveUsers,
-			usageSecondsByFamily: codersdk.SumByFamily(row.SessionAppUsageSeconds),
+			usageSecondsByFamily: usageSecondsByFamily,
 		})
 	}
 	return converted

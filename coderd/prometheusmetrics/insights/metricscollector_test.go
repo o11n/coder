@@ -112,10 +112,21 @@ func TestCollectInsights(t *testing.T) {
 			ConnectionCount:           1,
 			ConnectionMedianLatencyMs: 15,
 			// Session counts must be positive, but the exact value is ignored.
-			// Database query approximates it to 60s of usage.
-			SessionCountSsh:       99,
-			SessionCountJetbrains: 47,
-			SessionCountVscode:    34,
+			// Database query approximates it to 60s of usage. Apps of one
+			// family open in the same minute count that minute once, so VS
+			// Code with Cursor and SSH with Zed each report 60s, and an
+			// unregistered app reports under Unknown. A client may report
+			// sftp, which has its own series.
+			SessionCounts: map[string]int64{
+				"vscode":          34,
+				"cursor":          2,
+				"jetbrains":       47,
+				"ssh":             99,
+				"zed":             1,
+				"port_forwarding": 1,
+				"sftp":            1,
+				"future_ide":      1,
+			},
 		},
 	})
 	require.NoError(t, err, "unable to post fake stats")
