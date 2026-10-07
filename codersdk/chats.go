@@ -964,7 +964,7 @@ type ChatMessagesResponse struct {
 	QueuedMessages []ChatQueuedMessage `json:"queued_messages"`
 	HasMore        bool                `json:"has_more"`
 	// HistoryVersion is the chat's history_version for the messages in this
-	// page, to pass as after_revision when opening the stream. It is set only
+	// page. Pass it as the stream's history_version parameter. It is set only
 	// on pages requested without before_id or after_id.
 	HistoryVersion int64 `json:"history_version,omitempty"`
 }
@@ -1983,7 +1983,8 @@ type ChatStreamMessagePart struct {
 type ChatStreamStatus struct {
 	Status ChatStatus `json:"status"`
 	// HistoryVersion is the chat's history_version for the messages sent
-	// before this status, to pass as after_revision when reconnecting.
+	// before this status. Pass it as the stream's history_version parameter
+	// when reconnecting.
 	HistoryVersion int64 `json:"history_version,omitempty"`
 }
 
@@ -2201,7 +2202,7 @@ type ChatStreamEvent struct {
 }
 
 // ChatStreamHistoryReset is set on the history_reset events of streams
-// opened with after_revision. On such a reset, the client keeps its
+// opened with history_version. On such a reset, the client keeps its
 // messages with IDs below FromMessageID and replaces the rest with the
 // message events that follow. A history_reset without it replaces the
 // whole history.
@@ -3141,12 +3142,12 @@ type StreamChatOptions struct {
 	// that only need live message_part events and can skip the
 	// full message history.
 	AfterID *int64
-	// AfterRevision is the history version of the caller's messages, from
-	// ChatMessagesResponse or ChatStreamStatus. When it is set, the server
-	// ignores AfterID and history resets carry ChatStreamEvent.HistoryReset.
-	// When it is nil, every connection to a chat with a deleted message
-	// resends the whole history.
-	AfterRevision *int64
+	// HistoryVersion is the history version of the caller's messages, from
+	// ChatMessagesResponse or ChatStreamStatus. When it is non-zero, the
+	// server ignores AfterID and history resets carry
+	// ChatStreamEvent.HistoryReset. When it is nil or zero, every connection
+	// to a chat with a deleted message resends the whole history.
+	HistoryVersion *int64
 }
 
 // StreamChat streams chat updates in real time.
@@ -3161,8 +3162,8 @@ func (c *Client) StreamChat(ctx context.Context, chatID uuid.UUID, opts *StreamC
 		if opts.AfterID != nil {
 			query.Set("after_id", strconv.FormatInt(*opts.AfterID, 10))
 		}
-		if opts.AfterRevision != nil {
-			query.Set("after_revision", strconv.FormatInt(*opts.AfterRevision, 10))
+		if opts.HistoryVersion != nil {
+			query.Set("history_version", strconv.FormatInt(*opts.HistoryVersion, 10))
 		}
 		if len(query) > 0 {
 			path += "?" + query.Encode()
