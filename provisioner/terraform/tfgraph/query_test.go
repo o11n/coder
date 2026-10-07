@@ -155,6 +155,7 @@ func TestQueryReachableBoundaryNodes(t *testing.T) {
 			startNodes := index.NodesForInstanceAddress(test.startAddress)
 			boundaries, err := query.ReachableBoundaryNodes(
 				t.Context(), startNodes, test.isBoundary,
+				followAllDependencies,
 			)
 			require.NoError(t, err)
 			require.Equal(
@@ -164,33 +165,92 @@ func TestQueryReachableBoundaryNodes(t *testing.T) {
 	}
 }
 
-func TestQuerySkipsModuleExpansionEdges(t *testing.T) {
+func TestQueryFiltersModuleExpansionEdges(t *testing.T) {
 	t.Parallel()
 
-	// Terraform connects module inputs and outputs to the module expansion
-	// node. Dependencies of that node do not contribute values.
 	index, err := tfgraph.Parse(t.Context(), `digraph {
-		"[root] module.tool.var.agent_id (expand)"
-		"[root] module.tool.output.agent_id (expand)"
+		"[root] module.tool.var.direct_agent_id (expand)"
+		"[root] module.tool.var.repeated_agent_id (expand)"
+		"[root] module.tool.output.direct_agent_id (expand)"
+		"[root] module.tool.output.constant (expand)"
+		"[root] module.tool.output.inner (expand)"
+		"[root] module.tool.local.constant (expand)"
+		"[root] module.tool.terraform_data.inner (expand)"
 		"[root] module.tool (expand)"
 		"[root] coder_agent.main (expand)"
+		"[root] coder_agent.source (expand)"
 		"[root] coder_agent.other (expand)"
-		"[root] module.tool.var.agent_id (expand)" -> "[root] coder_agent.main (expand)"
-		"[root] module.tool.var.agent_id (expand)" -> "[root] module.tool (expand)"
-		"[root] module.tool.output.agent_id (expand)" -> "[root] coder_agent.main (expand)"
-		"[root] module.tool.output.agent_id (expand)" -> "[root] module.tool (expand)"
+		"[root] module.tool.var.direct_agent_id (expand)" -> "[root] coder_agent.main (expand)"
+		"[root] module.tool.var.direct_agent_id (expand)" -> "[root] module.tool (expand)"
+		"[root] module.tool.var.repeated_agent_id (expand)" -> "[root] module.tool (expand)"
+		"[root] module.tool.output.direct_agent_id (expand)" -> "[root] coder_agent.main (expand)"
+		"[root] module.tool.output.direct_agent_id (expand)" -> "[root] module.tool (expand)"
+		"[root] module.tool.output.constant (expand)" -> "[root] module.tool.local.constant (expand)"
+		"[root] module.tool.output.constant (expand)" -> "[root] module.tool (expand)"
+		"[root] module.tool.output.inner (expand)" -> "[root] module.tool.terraform_data.inner (expand)"
+		"[root] module.tool.output.inner (expand)" -> "[root] module.tool (expand)"
+		"[root] module.tool.local.constant (expand)" -> "[root] module.tool (expand)"
+		"[root] module.tool.terraform_data.inner (expand)" -> "[root] module.tool (expand)"
+		"[root] module.tool (expand)" -> "[root] coder_agent.source (expand)"
 		"[root] module.tool (expand)" -> "[root] coder_agent.other (expand)"
 	}`)
 	require.NoError(t, err)
+
+	// This models the module call's configuration: repeated_agent_id uses
+	// each.value, coder_agent.source is the for_each expression dependency,
+	// and coder_agent.other is a depends_on dependency. All other edges into
+	// the module expansion node are structural ordering edges.
+	followDependency := func(source, dependency tfgraph.Node) bool {
+		sourceAddress := source.ConfigurationAddress()
+		dependencyAddress := dependency.ConfigurationAddress()
+		switch {
+		case dependencyAddress == "module.tool":
+			return sourceAddress == "module.tool.var.repeated_agent_id"
+		case sourceAddress == "module.tool":
+			return dependencyAddress == "coder_agent.source"
+		default:
+			return true
+		}
+	}
 
 	for _, test := range []struct {
 		name          string
 		moduleAddress string
 		reference     string
+		expected      []string
 	}{
-		{name: "ModuleInput", moduleAddress: "module.tool", reference: "var.agent_id"},
-		{name: "ModuleOutput", reference: "module.tool.agent_id"},
-		{name: "WholeModule", reference: "module.tool"},
+		{
+			name:          "DirectModuleInput",
+			moduleAddress: "module.tool",
+			reference:     "var.direct_agent_id",
+			expected:      []string{"coder_agent.main"},
+		},
+		{
+			name:          "ForEachModuleInput",
+			moduleAddress: "module.tool",
+			reference:     "var.repeated_agent_id",
+			expected:      []string{"coder_agent.source"},
+		},
+		{
+			name:      "DirectModuleOutput",
+			reference: "module.tool.direct_agent_id",
+			expected:  []string{"coder_agent.main"},
+		},
+		{
+			name:      "ConstantLocalModuleOutput",
+			reference: "module.tool.constant",
+			expected:  []string{},
+		},
+		{
+			name:      "InnerResourceModuleOutput",
+			reference: "module.tool.inner",
+			expected:  []string{},
+		},
+		{
+			name:      "WholeModule",
+			reference: "module.tool",
+			expected:  []string{"coder_agent.main"},
+		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
@@ -204,14 +264,15 @@ func TestQuerySkipsModuleExpansionEdges(t *testing.T) {
 			boundaries, err := query.ReachableBoundaryNodes(
 				t.Context(), start,
 				func(node tfgraph.Node) bool {
-					address := node.ConfigurationAddress()
-					return address == "coder_agent.main" ||
-						address == "coder_agent.other"
+					return strings.HasPrefix(
+						node.ConfigurationAddress(), "coder_agent.",
+					)
 				},
+				followDependency,
 			)
 			require.NoError(t, err)
 			require.Equal(
-				t, []string{"coder_agent.main"}, nodeAddresses(t, index, boundaries),
+				t, test.expected, nodeAddresses(t, index, boundaries),
 			)
 		})
 	}
@@ -240,6 +301,7 @@ func TestQueryMatchesCapturedTerraformGraphs(t *testing.T) {
 					node.InstanceAddress(), "coder_devcontainer.repo[",
 				)
 			},
+			followAllDependencies,
 		)
 		require.NoError(t, err)
 		require.Equal(t,
@@ -265,6 +327,7 @@ func TestQueryMatchesCapturedTerraformGraphs(t *testing.T) {
 			func(node tfgraph.Node) bool {
 				return node.ConfigurationAddress() == "coder_agent.main"
 			},
+			followAllDependencies,
 		)
 		require.NoError(t, err)
 		require.Equal(
@@ -298,10 +361,120 @@ func TestQueryMatchesCapturedTerraformGraphs(t *testing.T) {
 			func(node tfgraph.Node) bool {
 				return node.ConfigurationAddress() == "coder_agent.main"
 			},
+			followAllDependencies,
 		)
 		require.NoError(t, err)
 		require.Equal(t,
 			[]string{"coder_agent.main"},
+			nodeAddresses(t, index, boundaries),
+		)
+	})
+
+	t.Run("ConfigDerivedStartsRecoverReducedModuleInputDependency", func(t *testing.T) {
+		t.Parallel()
+
+		// The module input and depends_on reference the same resource. Terraform
+		// therefore removes the input's direct value edge during transitive
+		// reduction, leaving only this path:
+		//
+		// module.tool.var.agent_id -> module.tool -> terraform_data.agent
+		//
+		// Plan configuration restores the omitted value dependency by resolving
+		// the input expression before graph traversal.
+		index := graphIndexFromFile(
+			t, "testdata/reduced-module-input-edge.tfplan.dot",
+		)
+		followDependency := func(source, dependency tfgraph.Node) bool {
+			return source.ConfigurationAddress() != "module.tool" &&
+				dependency.ConfigurationAddress() != "module.tool"
+		}
+
+		for _, test := range []struct {
+			name             string
+			inputReference   string
+			valueReferences  []string
+			expectedBoundary []string
+		}{
+			{
+				name:             "ReferencedInput",
+				inputReference:   "var.agent_id",
+				valueReferences:  []string{"terraform_data.agent.id"},
+				expectedBoundary: []string{"terraform_data.agent"},
+			},
+			{
+				name:             "UnrelatedInput",
+				inputReference:   "var.unrelated_id",
+				expectedBoundary: []string{},
+			},
+		} {
+			t.Run(test.name, func(t *testing.T) {
+				t.Parallel()
+
+				query, err := tfgraph.NewQuery(index)
+				require.NoError(t, err)
+				startNodes, err := query.ConfigurationNodesForReferences(
+					t.Context(), "module.tool", []string{test.inputReference},
+				)
+				require.NoError(t, err)
+				valueNodes, err := query.ConfigurationNodesForReferences(
+					t.Context(), "", test.valueReferences,
+				)
+				require.NoError(t, err)
+				startNodes = append(startNodes, valueNodes...)
+
+				boundaries, err := query.ReachableBoundaryNodes(
+					t.Context(), startNodes,
+					func(node tfgraph.Node) bool {
+						return node.ConfigurationAddress() ==
+							"terraform_data.agent"
+					},
+					followDependency,
+				)
+				require.NoError(t, err)
+				require.Equal(
+					t, test.expectedBoundary,
+					nodeAddresses(t, index, boundaries),
+				)
+			})
+		}
+	})
+
+	t.Run("PlanGraphSkipsModuleCloseCompletionOnlyEdges", func(t *testing.T) {
+		t.Parallel()
+
+		index := graphIndexFromFile(
+			t, "testdata/whole-module-reference.tfplan.dot",
+		)
+		query, err := tfgraph.NewQuery(index)
+		require.NoError(t, err)
+		startNodes, err := query.ConfigurationNodesForReferences(
+			t.Context(), "", []string{"module.runtime.component"},
+		)
+		require.NoError(t, err)
+		require.Equal(
+			t, []string{"module.runtime.output.component"},
+			nodeAddresses(t, index, startNodes),
+		)
+
+		// A module close node depends on both its output nodes and unrelated
+		// nodes that only order completion. Only outputs contribute to the
+		// whole-module value.
+		boundaries, err := query.ReachableBoundaryNodes(
+			t.Context(), startNodes,
+			func(node tfgraph.Node) bool {
+				return strings.HasPrefix(
+					node.ConfigurationAddress(),
+					"module.runtime.module.component.terraform_data.",
+				)
+			},
+			followAllDependencies,
+		)
+		require.NoError(t, err)
+		require.Equal(
+			t,
+			[]string{
+				"module.runtime.module.component.terraform_data.referenced",
+			},
 			nodeAddresses(t, index, boundaries),
 		)
 	})
@@ -341,6 +514,7 @@ func TestQueryResultsAreDeterministic(t *testing.T) {
 			t.Context(), duplicatedStartNodes, func(node tfgraph.Node) bool {
 				return strings.HasPrefix(node.Address(), "null_resource.")
 			},
+			followAllDependencies,
 		)
 		require.NoError(t, err)
 		require.Equal(
@@ -366,15 +540,23 @@ func TestQueryRejectsInvalidInputs(t *testing.T) {
 
 	_, err = firstQuery.ReachableBoundaryNodes(
 		t.Context(), []tfgraph.NodeID{{}}, func(tfgraph.Node) bool { return false },
+		followAllDependencies,
 	)
 	require.ErrorContains(t, err, "outside its index")
 	_, err = firstQuery.ReachableBoundaryNodes(
 		t.Context(), second.NodesForInstanceAddress("local.second"),
 		func(tfgraph.Node) bool { return false },
+		followAllDependencies,
 	)
 	require.ErrorContains(t, err, "outside its index")
-	_, err = firstQuery.ReachableBoundaryNodes(t.Context(), nil, nil)
+	_, err = firstQuery.ReachableBoundaryNodes(
+		t.Context(), nil, nil, followAllDependencies,
+	)
 	require.ErrorContains(t, err, "boundary predicate is required")
+	_, err = firstQuery.ReachableBoundaryNodes(
+		t.Context(), nil, func(tfgraph.Node) bool { return false }, nil,
+	)
+	require.ErrorContains(t, err, "dependency filter is required")
 }
 
 func TestQueryHonorsCancellation(t *testing.T) {
@@ -402,6 +584,7 @@ func TestQueryHonorsCancellation(t *testing.T) {
 		_, err = query.ReachableBoundaryNodes(
 			ctx, index.NodesForConfigurationAddress("local.first"),
 			func(tfgraph.Node) bool { return false },
+			followAllDependencies,
 		)
 		require.ErrorIs(t, err, context.Canceled)
 	})
@@ -440,6 +623,7 @@ func TestQueryHonorsCancellation(t *testing.T) {
 				cancel()
 				return false
 			},
+			followAllDependencies,
 		)
 		require.ErrorIs(t, err, context.Canceled)
 		require.Equal(t, 1, visited)
@@ -484,4 +668,8 @@ func nodeAddresses(
 		addresses = append(addresses, node.Address())
 	}
 	return addresses
+}
+
+func followAllDependencies(tfgraph.Node, tfgraph.Node) bool {
+	return true
 }

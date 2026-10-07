@@ -98,6 +98,7 @@ func TestQueryBoundsWork(t *testing.T) {
 		boundaries, err := query.ReachableBoundaryNodes(
 			t.Context(), []NodeID{start[0], start[0]},
 			func(Node) bool { return true },
+			followAllDependencies,
 		)
 		require.NoError(t, err)
 		require.Equal(t, start, boundaries)
@@ -134,6 +135,7 @@ func TestQueryBoundsWork(t *testing.T) {
 			func(node Node) bool {
 				return node.InstanceAddress() == "coder_agent.main"
 			},
+			followAllDependencies,
 		)
 		require.NoError(t, err)
 		require.Equal(t, boundary, boundaries)
@@ -159,6 +161,7 @@ func TestQueryBoundsWork(t *testing.T) {
 		require.NoError(t, err)
 		_, err = query.ReachableBoundaryNodes(
 			t.Context(), start, func(Node) bool { return false },
+			followAllDependencies,
 		)
 		require.ErrorContains(t, err, "Terraform graph node visits")
 	})
@@ -176,6 +179,7 @@ func TestQueryBoundsWork(t *testing.T) {
 			t.Context(),
 			index.NodesForConfigurationAddress("local.bridge.attribute"),
 			func(Node) bool { return false },
+			followAllDependencies,
 		)
 		require.ErrorContains(t, err, "Terraform graph traversed edges")
 	})
@@ -224,6 +228,7 @@ func TestQueryAccumulatesWorkPerRequest(t *testing.T) {
 			run: func(t *testing.T, query *Query) error {
 				_, err := query.ReachableBoundaryNodes(
 					t.Context(), start, func(Node) bool { return true },
+					followAllDependencies,
 				)
 				return err
 			},
@@ -239,6 +244,7 @@ func TestQueryAccumulatesWorkPerRequest(t *testing.T) {
 			run: func(t *testing.T, query *Query) error {
 				_, err := query.ReachableBoundaryNodes(
 					t.Context(), start, func(Node) bool { return false },
+					followAllDependencies,
 				)
 				return err
 			},
@@ -258,4 +264,8 @@ func TestQueryAccumulatesWorkPerRequest(t *testing.T) {
 			require.NoError(t, test.run(t, freshQuery))
 		})
 	}
+}
+
+func followAllDependencies(Node, Node) bool {
+	return true
 }

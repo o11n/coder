@@ -6,7 +6,6 @@ import (
 	"iter"
 	"maps"
 	"slices"
-	"strings"
 
 	"golang.org/x/xerrors"
 
@@ -156,8 +155,28 @@ func wholeModuleReferenceAddress(
 
 // ReachableBoundaryNodes returns nodes matching isBoundary that are reachable
 // by following forward dependencies from startNodes. A matching node ends its
-// dependency path, so matches beyond it are excluded. Module-expansion ordering
-// edges are not followed.
+// dependency path, so matches beyond it are excluded.
+//
+// followDependency decides whether to follow each candidate edge from a visited
+// non-boundary source. The start nodes are enqueued without consulting it. The
+// same dependency may be passed more than once when reached from different
+// sources. Module close completion edges are rejected internally before the
+// policy is called and are not passed to it.
+//
+// The policy lets callers use information outside the graph, such as Terraform
+// plan configuration, to decide whether an edge contributes to the referenced
+// value when graph metadata alone is insufficient. It can only filter edges
+// present in the graph. Terraform may omit a direct value edge during
+// transitive reduction when another path reaches the same node. Callers
+// must resolve those value references from plan configuration and include the
+// resulting nodes in startNodes before traversal. For module expansion nodes,
+// callers must filter both edges into the expansion node and edges from it. For
+// example, outgoing edges from an expansion node to for_each and depends_on
+// references have the same graph shape, although only the for_each collection
+// can contribute to an input expressed as each.value.
+//
+// Module close nodes are followed only through their direct output nodes
+// because their other dependencies only ensure they finish before the module.
 //
 // Each graph node is traversed at most once, so duplicate start nodes and
 // converging paths do not duplicate results. Results are returned in
@@ -166,12 +185,16 @@ func (q *Query) ReachableBoundaryNodes(
 	ctx context.Context,
 	startNodes []NodeID,
 	isBoundary func(Node) bool,
+	followDependency func(source, dependency Node) bool,
 ) ([]NodeID, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	if isBoundary == nil {
 		return nil, xerrors.New("Terraform graph boundary predicate is required")
+	}
+	if followDependency == nil {
+		return nil, xerrors.New("Terraform graph dependency filter is required")
 	}
 
 	queued := make(map[NodeID]struct{}, len(startNodes))
@@ -205,14 +228,22 @@ func (q *Query) ReachableBoundaryNodes(
 		if err := q.consumeTraversedEdges(len(dependencies)); err != nil {
 			return nil, err
 		}
+		moduleCloseAddress, isModuleClose := moduleCloseConfigurationAddress(node)
 		for _, dependency := range dependencies {
-			if _, ok := queued[dependency]; ok {
+			position, ok := q.index.nodePosition(dependency)
+			if !ok {
+				return nil, xerrors.New(
+					"Terraform graph query references a node outside its index",
+				)
+			}
+			dependencyNode := q.index.nodes[position]
+			if (isModuleClose && isModuleCloseCompletionOnlyDependency(
+				moduleCloseAddress,
+				dependencyNode,
+			)) || !followDependency(node, dependencyNode) {
 				continue
 			}
-			// Module inputs and outputs do not derive values from
-			// their module's expansion node.
-			if position, ok := q.index.nodePosition(dependency); ok &&
-				isModuleExpansionEdge(node, q.index.nodes[position]) {
+			if _, ok := queued[dependency]; ok {
 				continue
 			}
 			queued[dependency] = struct{}{}
@@ -222,18 +253,28 @@ func (q *Query) ReachableBoundaryNodes(
 	return sortedNodeIDs(maps.Keys(boundaries)), nil
 }
 
-func isModuleExpansionEdge(source, destination Node) bool {
-	sourceAddress := source.ConfigurationAddress()
-	destinationAddress := destination.ConfigurationAddress()
-	if sourceAddress == "" || destinationAddress == "" {
-		return false
+func moduleCloseConfigurationAddress(node Node) (string, bool) {
+	if node.Operation() != "close" {
+		return "", false
 	}
-	if !strings.HasPrefix(sourceAddress, destinationAddress+".var.") &&
-		!strings.HasPrefix(sourceAddress, destinationAddress+".output.") {
-		return false
+	modulePath, err := tfaddr.ParseModulePath(node.Address())
+	if err != nil || len(modulePath.Steps()) == 0 {
+		return "", false
 	}
-	_, err := tfaddr.ParseModulePath(destinationAddress)
-	return err == nil
+	return modulePath.ConfigurationAddress(), true
+}
+
+func isModuleCloseCompletionOnlyDependency(
+	moduleAddress string,
+	dependency Node,
+) bool {
+	dependencyModuleAddress, ok := moduleAddressForOutput(
+		dependency.ConfigurationAddress(),
+	)
+	// Terraform currently emits output edges only for the closing
+	// module. But keep checking ownership so nested-module outputs
+	// remain completion-only if the graph shape changes.
+	return !ok || dependencyModuleAddress != moduleAddress
 }
 
 func (q *Query) consumeReferenceLookups(count int) error {
