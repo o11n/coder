@@ -42,6 +42,10 @@ type ReportOptions struct {
 
 	DERPMap *tailcfg.DERPMap
 
+	// ForceWebsockets connects to DERP over WebSockets, like clients do when
+	// CODER_DERP_FORCE_WEBSOCKETS is set.
+	ForceWebsockets bool
+
 	// DERPTLSConfig is an optional TLS config for DERP connections.
 	DERPTLSConfig *tls.Config
 }
@@ -50,15 +54,17 @@ type Report healthsdk.DERPHealthReport
 
 type RegionReport struct {
 	healthsdk.DERPRegionReport
-	mu            sync.Mutex
-	derpTLSConfig *tls.Config
+	mu              sync.Mutex
+	derpTLSConfig   *tls.Config
+	forceWebsockets bool
 }
 
 type NodeReport struct {
 	healthsdk.DERPNodeReport
-	mu            sync.Mutex
-	clientCounter int
-	derpTLSConfig *tls.Config
+	mu              sync.Mutex
+	clientCounter   int
+	derpTLSConfig   *tls.Config
+	forceWebsockets bool
 }
 
 func (r *Report) Run(ctx context.Context, opts *ReportOptions) {
@@ -89,7 +95,8 @@ func (r *Report) Run(ctx context.Context, opts *ReportOptions) {
 				DERPRegionReport: healthsdk.DERPRegionReport{
 					Region: region,
 				},
-				derpTLSConfig: opts.DERPTLSConfig,
+				derpTLSConfig:   opts.DERPTLSConfig,
+				forceWebsockets: opts.ForceWebsockets,
 			}
 		)
 		go func() {
@@ -184,7 +191,8 @@ func (r *RegionReport) Run(ctx context.Context) {
 					Healthy: true,
 					Node:    node,
 				},
-				derpTLSConfig: r.derpTLSConfig,
+				derpTLSConfig:   r.derpTLSConfig,
+				forceWebsockets: r.forceWebsockets,
 			}
 		)
 
@@ -505,6 +513,7 @@ func (r *NodeReport) derpClient(ctx context.Context, derpURL *url.URL) (*derphtt
 	if r.derpTLSConfig != nil {
 		client.TLSConfig = r.derpTLSConfig
 	}
+	client.ForceWebsockets = r.forceWebsockets
 
 	go func() {
 		<-ctx.Done()

@@ -822,7 +822,8 @@ func New(options *Options) *API {
 					AccessURL: options.AccessURL,
 				},
 				DerpHealth: derphealth.ReportOptions{
-					DERPMap: api.DERPMap(),
+					DERPMap:         api.DERPMap(),
+					ForceWebsockets: options.DeploymentValues.DERP.Config.ForceWebSockets.Value(),
 				},
 				WorkspaceProxy: healthcheck.WorkspaceProxyReportOptions{
 					WorkspaceProxiesFetchUpdater: *(options.WorkspaceProxiesFetchUpdater).Load(),

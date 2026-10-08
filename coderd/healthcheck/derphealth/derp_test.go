@@ -365,6 +365,72 @@ func TestDERP(t *testing.T) {
 		}
 	})
 
+	t.Run("ForceWebsockets", func(t *testing.T) {
+		t.Parallel()
+
+		derpSrv := derp.NewServer(key.NewNode(), func(format string, args ...any) { t.Logf(format, args...) })
+		defer derpSrv.Close()
+		handler, closeHandler := tailnet.WithWebsocketSupport(derpSrv, derphttp.Handler(derpSrv))
+		defer closeHandler()
+
+		// Some proxies answer "Upgrade: DERP" with 101 but never pass on the
+		// data that follows. Clients do not fall back to WebSockets on their
+		// own then, so only ForceWebsockets gets through.
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Header.Get("Upgrade") == "DERP" {
+				conn, _, err := w.(http.Hijacker).Hijack()
+				if !assert.NoError(t, err) {
+					return
+				}
+				t.Cleanup(func() { _ = conn.Close() })
+				_, _ = conn.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nUpgrade: DERP\r\nConnection: Upgrade\r\n\r\n"))
+				return
+			}
+
+			handler.ServeHTTP(w, r)
+		}))
+		defer srv.Close()
+
+		var (
+			ctx        = testutil.Context(t, testutil.WaitLong)
+			report     = derphealth.Report{}
+			derpURL, _ = url.Parse(srv.URL)
+			opts       = &derphealth.ReportOptions{
+				ForceWebsockets: true,
+				DERPMap: &tailcfg.DERPMap{Regions: map[int]*tailcfg.DERPRegion{
+					1: {
+						EmbeddedRelay: true,
+						RegionID:      999,
+						Nodes: []*tailcfg.DERPNode{{
+							Name:             "1a",
+							RegionID:         999,
+							HostName:         derpURL.Host,
+							IPv4:             derpURL.Host,
+							STUNPort:         -1,
+							InsecureForTests: true,
+							ForceHTTP:        true,
+						}},
+					},
+				}},
+			}
+		)
+
+		report.Run(ctx, opts)
+
+		assert.True(t, report.Healthy)
+		assert.Equal(t, health.SeverityOK, report.Severity)
+		for _, region := range report.Regions {
+			assert.True(t, region.Healthy)
+			for _, node := range region.NodeReports {
+				assert.True(t, node.Healthy)
+				assert.True(t, node.CanExchangeMessages)
+				assert.Empty(t, node.ClientErrs[0])
+				assert.Empty(t, node.ClientErrs[1])
+				assert.False(t, node.UsesWebsocket)
+			}
+		}
+	})
+
 	t.Run("STUNOnly/WarnsNoDERP", func(t *testing.T) {
 		t.Parallel()
 		stunPort := serveSTUN(t)
